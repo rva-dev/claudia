@@ -1,25 +1,12 @@
 const fs = require('fs'),
-	promisify = function (target, methodName) {
+	util = require('util'),
+	build = function () {
 		'use strict';
-		return function () {
-			const originalArgs = Array.prototype.slice.call(arguments);
-			return new Promise((resolve, reject) => {
-				const cb = function (err, data) {
-					if (err) {
-						reject(err);
-					} else {
-						resolve(data);
-					}
-				};
-				originalArgs.push(cb);
-				target[methodName].apply(target, originalArgs);
-			});
-		};
+		const result = {},
+			methods = ['writeFile', 'readFile', 'unlink', 'chmod', 'stat', 'rename', 'mkdtemp', 'mkdir'];
+		methods.forEach(method => result[`${method}Async`] = util.promisify(fs[method]));
+		return result;
 	};
+module.exports = build();
 
-module.exports = {
-	writeFileAsync: promisify(fs, 'writeFile'),
-	readFileAsync: promisify(fs, 'readFile'),
-	unlinkAsync: promisify(fs, 'unlink'),
-	renameAsync: promisify(fs, 'rename')
-};
+

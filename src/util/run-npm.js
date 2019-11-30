@@ -1,27 +1,46 @@
+let npmPath;
 const removeKeysWithPrefix = require('./remove-keys-with-prefix'),
-	execPromise = require('./exec-promise'),
-	fsUtil = require('./fs-util'),
-	fsPromise = require('./fs-promise'),
-	tmppath = require('./tmppath');
-module.exports = function runNpm(dir, options, logger) {
+	which = require('which'),
+	spawnPromise = require('./spawn-promise'),
+	findNpm = function () {
+		'use strict';
+		if (npmPath) {
+			return Promise.resolve(npmPath);
+		}
+		return new Promise((resolve, reject) => {
+			which('npm', (err, path) => {
+				if (err) {
+					return reject(err);
+				}
+				npmPath = path;
+				resolve(path);
+			});
+		});
+
+	},
+	toArgs = function (opts) {
+		'use strict';
+		if (!opts) {
+			return [];
+		}
+		if (Array.isArray(opts)) {
+			return opts;
+		}
+		if (typeof opts === 'string') {
+			return opts.split(' ');
+		}
+		throw new Error('cannot convert to options', opts);
+	};
+module.exports = function runNpm(dir, options, logger, suppressOutput) {
 	'use strict';
-	const cwd = process.cwd(),
-		npmlog = tmppath(),
-		command = 'npm ' + options;
-	let env = process.env;
-	logger.logApiCall(command);
-	process.chdir(dir);
-	if (fsUtil.fileExists('.npmrc')) {
-		env = removeKeysWithPrefix(process.env, 'npm_');
-	}
-	return execPromise(command + ' > ' + npmlog + ' 2>&1', {env: env})
-	.then(() => fsPromise.unlinkAsync(npmlog))
-	.then(() => {
-		process.chdir(cwd);
-		return dir;
-	})
+	const env = removeKeysWithPrefix(process.env, 'npm_'),
+		args = toArgs(options),
+		commandDesc = 'npm ' + args.join(' ');
+	logger.logApiCall(commandDesc);
+	return findNpm()
+	.then(command => spawnPromise(command, args, {env: env, cwd: dir}, suppressOutput))
+	.then(() => dir)
 	.catch(() => {
-		process.chdir(cwd);
-		return Promise.reject(command + ' failed. Check ' + npmlog);
+		return Promise.reject(commandDesc + ' failed.');
 	});
 };

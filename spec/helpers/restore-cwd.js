@@ -1,10 +1,9 @@
-/*global require, beforeEach, afterEach*/
-const shell = require('shelljs'),
-	cwd = shell.pwd();
+/*global beforeEach, afterEach*/
+const cwd = process.cwd();
 beforeEach(() => {
 	'use strict';
 });
 afterEach(() => {
 	'use strict';
-	shell.cd(cwd);
+	process.chdir(cwd);
 });

@@ -3,9 +3,10 @@ const underTest = require('../src/tasks/register-authorizers'),
 	destroyObjects = require('./util/destroy-objects'),
 	genericTestRole = require('./util/generic-role'),
 	create = require('../src/commands/create'),
-	shell = require('shelljs'),
 	path = require('path'),
+	fs = require('fs'),
 	tmppath = require('../src/util/tmppath'),
+	fsUtil = require('../src/util/fs-util'),
 	aws = require('aws-sdk'),
 	retriableWrap = require('../src/util/retriable-wrap'),
 	cognitoUserPool = require('./util/cognito-user-pool'),
@@ -13,7 +14,7 @@ const underTest = require('../src/tasks/register-authorizers'),
 
 describe('registerAuthorizers', () => {
 	'use strict';
-	let authorizerLambdaName, workingdir, testRunName, newObjects, apiId, authorizerArn, ownerId;
+	let authorizerLambdaName, workingdir, testRunName, newObjects, apiId, authorizerArn, ownerId, awsPartition;
 	const apiGateway = retriableWrap(new aws.APIGateway({ region: awsRegion })),
 		lambda = new aws.Lambda({ region: awsRegion }),
 		iam = new aws.IAM({ region: awsRegion }),
@@ -31,8 +32,8 @@ describe('registerAuthorizers', () => {
 		testRunName = 'test' + Date.now();
 
 		newObjects = { workingdir: workingdir };
-		shell.mkdir(workingdir);
-		shell.cp('-r', 'spec/test-projects/echo/*', workingdir);
+		fs.mkdirSync(workingdir);
+		fsUtil.copy('spec/test-projects/echo', workingdir, true);
 		create({ name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler' })
 		.then(result => {
 			newObjects.lambdaFunction = result.lambda && result.lambda.name;
@@ -44,8 +45,8 @@ describe('registerAuthorizers', () => {
 		})
 		.then(() => {
 			authorizerLambdaDir = path.join(workingdir, 'authorizer');
-			shell.mkdir(authorizerLambdaDir);
-			shell.cp('-r', 'spec/test-projects/echo/*', authorizerLambdaDir);
+			fs.mkdirSync(authorizerLambdaDir);
+			fsUtil.copy('spec/test-projects/echo', authorizerLambdaDir, true);
 			return create({ name: testRunName + 'auth', version: 'original', role: genericTestRole.get(), region: awsRegion, source: authorizerLambdaDir, handler: 'main.handler' });
 		})
 		.then(result => {
@@ -56,7 +57,9 @@ describe('registerAuthorizers', () => {
 			authorizerArn = lambdaConfig.FunctionArn;
 		})
 		.then(() => {
-			ownerId = authorizerArn.split(':')[4];
+			const components = authorizerArn.split(':');
+			ownerId = components[4];
+			awsPartition = components[1];
 		})
 		.then(done, e => {
 			console.log('error setting up', e);
@@ -73,7 +76,7 @@ describe('registerAuthorizers', () => {
 		.then(done, done.fail);
 	});
 	it('does nothing when authorizers are not defined', done => {
-		underTest(false, apiId, awsRegion)
+		underTest(false, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => expect(createResult).toEqual({}))
 		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
 		.then(authorizers => expect(authorizers.items).toEqual([]))
@@ -86,7 +89,7 @@ describe('registerAuthorizers', () => {
 			}
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -104,11 +107,87 @@ describe('registerAuthorizers', () => {
 		})
 		.then(done, done.fail);
 	});
+	it('creates header-based authorizers with an identity source', done => {
+		const authorizerConfig = {
+			first: {
+				lambdaName: authorizerLambdaName, identitySource: 'method.request.header.Auth2'
+			}
+		};
+		let result;
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
+		.then(createResult => {
+			result = createResult;
+		})
+		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
+		.then(authorizers => {
+			expect(authorizers.items.length).toEqual(1);
+			expect(result.first).toEqual(authorizers.items[0].id);
+			expect(authorizers.items[0].name).toEqual('first');
+			expect(authorizers.items[0].type).toEqual('TOKEN');
+			expect(authorizers.items[0].authorizerCredentials).toBeFalsy();
+			expect(authorizers.items[0].authorizerResultTtlInSeconds).toBeFalsy();
+			expect(authorizers.items[0].identityValidationExpression).toBeFalsy();
+			expect(authorizers.items[0].identitySource).toEqual('method.request.header.Auth2');
+			checkAuthUri(authorizers.items[0].authorizerUri);
+		})
+		.then(done, done.fail);
+	});
+	it('creates request-based authorizers with a header', done => {
+		const authorizerConfig = {
+			first: {
+				lambdaName: authorizerLambdaName, type: 'REQUEST', headerName: 'Authorization'
+			}
+		};
+		let result;
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
+		.then(createResult => {
+			result = createResult;
+		})
+		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
+		.then(authorizers => {
+			expect(authorizers.items.length).toEqual(1);
+			expect(result.first).toEqual(authorizers.items[0].id);
+			expect(authorizers.items[0].name).toEqual('first');
+			expect(authorizers.items[0].type).toEqual('REQUEST');
+			expect(authorizers.items[0].authorizerCredentials).toBeFalsy();
+			expect(authorizers.items[0].authorizerResultTtlInSeconds).toBeFalsy();
+			expect(authorizers.items[0].identityValidationExpression).toBeFalsy();
+			expect(authorizers.items[0].identitySource).toEqual('method.request.header.Authorization');
+			checkAuthUri(authorizers.items[0].authorizerUri);
+		})
+		.then(done, done.fail);
+	});
+
+	it('creates request-based authorizers with an identity source', done => {
+		const authorizerConfig = {
+			first: {
+				lambdaName: authorizerLambdaName, type: 'REQUEST', identitySource: 'method.request.header.Auth, method.request.querystring.Name'
+			}
+		};
+		let result;
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
+		.then(createResult => {
+			result = createResult;
+		})
+		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
+		.then(authorizers => {
+			expect(authorizers.items.length).toEqual(1);
+			expect(result.first).toEqual(authorizers.items[0].id);
+			expect(authorizers.items[0].name).toEqual('first');
+			expect(authorizers.items[0].type).toEqual('REQUEST');
+			expect(authorizers.items[0].authorizerCredentials).toBeFalsy();
+			expect(authorizers.items[0].authorizerResultTtlInSeconds).toBeFalsy();
+			expect(authorizers.items[0].identityValidationExpression).toBeFalsy();
+			expect(authorizers.items[0].identitySource).toEqual('method.request.header.Auth, method.request.querystring.Name');
+			checkAuthUri(authorizers.items[0].authorizerUri);
+		})
+		.then(done, done.fail);
+	});
 	it('assigns a token validation regex if supplied', done => {
 		const authorizerConfig = {
 			first: { lambdaName: authorizerLambdaName,  validationExpression: 'A-Z' }
 		};
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
 		.then(authorizers => expect(authorizers.items[0].identityValidationExpression).toEqual('A-Z'))
 		.then(done, done.fail);
@@ -124,7 +203,7 @@ describe('registerAuthorizers', () => {
 			const authorizerConfig = {
 				first: { lambdaName: authorizerLambdaName,  credentials: roleArn }
 			};
-			return underTest(authorizerConfig, apiId, awsRegion);
+			return underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion);
 		})
 		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
 		.then(authorizers => expect(authorizers.items[0].authorizerCredentials).toEqual(roleArn))
@@ -135,7 +214,7 @@ describe('registerAuthorizers', () => {
 			first: { lambdaName: authorizerLambdaName,  resultTtl: 5 }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -148,12 +227,48 @@ describe('registerAuthorizers', () => {
 		})
 		.then(done, done.fail);
 	});
+	it('assigns authorizer ttl undefined if value not supplied', done => {
+		const authorizerConfig = {
+			first: { lambdaName: authorizerLambdaName }
+		};
+		let result;
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
+		.then(createResult => {
+			result = createResult;
+		})
+		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
+		.then(authorizers => {
+			expect(authorizers.items.length).toEqual(1);
+			expect(result.first).toEqual(authorizers.items[0].id);
+			expect(authorizers.items[0].authorizerResultTtlInSeconds).toEqual(undefined);
+			checkAuthUri(authorizers.items[0].authorizerUri);
+		})
+		.then(done, done.fail);
+	});
+	it('assigns authorizer ttl in 0 seconds if 0 supplied as a value', done => {
+		const authorizerConfig = {
+			first: { lambdaName: authorizerLambdaName, resultTtl: 0 }
+		};
+		let result;
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
+		.then(createResult => {
+			result = createResult;
+		})
+		.then(() => apiGateway.getAuthorizersPromise({ restApiId: apiId }))
+		.then(authorizers => {
+			expect(authorizers.items.length).toEqual(1);
+			expect(result.first).toEqual(authorizers.items[0].id);
+			expect(authorizers.items[0].authorizerResultTtlInSeconds).toEqual(0);
+			checkAuthUri(authorizers.items[0].authorizerUri);
+		})
+		.then(done, done.fail);
+	});
 	it('uses the Authorization header by default', done => {
 		const authorizerConfig = {
 			first: { lambdaName: authorizerLambdaName }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -174,7 +289,7 @@ describe('registerAuthorizers', () => {
 			second: { lambdaName: authorizerLambdaName, headerName: 'UserId' }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(creationResult => {
 			result = creationResult;
 		})
@@ -219,7 +334,7 @@ describe('registerAuthorizers', () => {
 				authorizerUri: `arn:aws:apigateway:${awsRegion}:lambda:path/2015-03-31/functions/${authorizerArn}/invocations`
 			});
 		})
-		.then(() => underTest(authorizerConfig, apiId, awsRegion))
+		.then(() => underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion))
 		.then(creationResult => {
 			result = creationResult;
 		})
@@ -247,7 +362,7 @@ describe('registerAuthorizers', () => {
 			first: { lambdaArn: authorizerArn }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -267,7 +382,7 @@ describe('registerAuthorizers', () => {
 			first: { lambdaName: authorizerLambdaName, lambdaVersion: true }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -294,7 +409,7 @@ describe('registerAuthorizers', () => {
 				first: { providerARNs: [cognitoUserPool.getArn()]}
 			};
 			let result;
-			underTest(authorizerConfig, apiId, awsRegion)
+			underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 			.then(createResult => {
 				result = createResult;
 			})
@@ -323,7 +438,7 @@ describe('registerAuthorizers', () => {
 			first: { lambdaName: authorizerLambdaName, lambdaVersion: 'original' }
 		};
 		let result;
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(createResult => {
 			result = createResult;
 		})
@@ -342,7 +457,7 @@ describe('registerAuthorizers', () => {
 		const authorizerConfig = {
 			first: { lambdaName: authorizerLambdaName }
 		};
-		underTest(authorizerConfig, apiId, awsRegion)
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion)
 		.then(() => {
 			return lambda.getPolicy({
 				FunctionName: authorizerLambdaName
@@ -359,7 +474,7 @@ describe('registerAuthorizers', () => {
 		const authorizerConfig = {
 			first: { lambdaName: authorizerLambdaName, lambdaVersion: 'original' }
 		};
-		underTest(authorizerConfig, apiId, awsRegion, 'development')
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion, 'development')
 		.then(() => {
 			return lambda.getPolicy({
 				FunctionName: authorizerLambdaName,
@@ -377,7 +492,7 @@ describe('registerAuthorizers', () => {
 		const authorizerConfig = {
 			first: { lambdaName: authorizerLambdaName, lambdaVersion: true }
 		};
-		underTest(authorizerConfig, apiId, awsRegion, 'original')
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion, 'original')
 		.then(() => {
 			return lambda.getPolicy({
 				FunctionName: authorizerLambdaName,
@@ -395,7 +510,7 @@ describe('registerAuthorizers', () => {
 		const authorizerConfig = {
 			first: { lambdaArn: authorizerArn }
 		};
-		underTest(authorizerConfig, apiId, awsRegion, 'original')
+		underTest(authorizerConfig, apiId, ownerId, awsPartition, awsRegion, 'original')
 		.then(() => {
 			return lambda.getPolicy({
 				FunctionName: authorizerLambdaName

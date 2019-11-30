@@ -3,11 +3,9 @@ const aws = require('aws-sdk'),
 	retriableWrap = require('../util/retriable-wrap'),
 	allowApiInvocation = require('./allow-api-invocation'),
 	NullLogger = require('../util/null-logger'),
-	sequentialPromiseMap = require('sequential-promise-map'),
-	getOwnerId = require('./get-owner-account-id');
-module.exports = function registerAuthorizers(authorizerMap, apiId, awsRegion, functionVersion, optionalLogger) {
+	sequentialPromiseMap = require('sequential-promise-map');
+module.exports = function registerAuthorizers(authorizerMap, apiId, ownerAccount, awsPartition, awsRegion, functionVersion, optionalLogger) {
 	'use strict';
-	let ownerId;
 	const logger = optionalLogger || new NullLogger(),
 		apiGateway = retriableWrap(
 			loggingWrap(
@@ -52,23 +50,25 @@ module.exports = function registerAuthorizers(authorizerMap, apiId, awsRegion, f
 				authLambdaQualifier = functionVersion;
 			}
 			if (authConfig.lambdaName) {
-				return allowApiInvocation(authConfig.lambdaName, authLambdaQualifier, apiId, ownerId, awsRegion, 'authorizers/*');
+				return allowApiInvocation(authConfig.lambdaName, authLambdaQualifier, apiId, ownerAccount, awsPartition, awsRegion, 'authorizers/*');
 			} else {
 				return Promise.resolve();
 			}
 		},
 		configureAuthorizer = function (authConfig, lambdaArn, authName) {
 			const type = getAuthorizerType(authConfig),
+				identityHeader = 'method.request.header.' + (authConfig.headerName || 'Authorization'),
+				identitySource = authConfig.identitySource || identityHeader,
 				params = {
-					identitySource: 'method.request.header.' + (authConfig.headerName || 'Authorization'),
+					identitySource: identitySource,
 					name: authName,
 					restApiId: apiId,
 					type: type
 				};
-			if (type === 'TOKEN') {
-				params.authorizerUri = 'arn:aws:apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/' + lambdaArn + '/invocations';
-			} else if (type === 'COGNITO_USER_POOLS') {
+			if (type === 'COGNITO_USER_POOLS') {
 				params.providerARNs = authConfig.providerARNs;
+			} else {
+				params.authorizerUri = 'arn:' + awsPartition + ':apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/' + lambdaArn + '/invocations';
 			}
 			if (authConfig.validationExpression) {
 				params.identityValidationExpression = authConfig.validationExpression;
@@ -76,7 +76,7 @@ module.exports = function registerAuthorizers(authorizerMap, apiId, awsRegion, f
 			if (authConfig.credentials) {
 				params.authorizerCredentials = authConfig.credentials;
 			}
-			if (authConfig.resultTtl) {
+			if (Number.isInteger(authConfig.resultTtl)) {
 				params.authorizerResultTtlInSeconds = authConfig.resultTtl;
 			}
 			return params;
@@ -100,8 +100,6 @@ module.exports = function registerAuthorizers(authorizerMap, apiId, awsRegion, f
 
 	return apiGateway.getAuthorizersPromise({restApiId: apiId})
 	.then(existingAuthorizers => sequentialPromiseMap(existingAuthorizers.items, removeAuthorizer))
-	.then(getOwnerId)
-	.then(accountId => ownerId = accountId)
 	.then(() => sequentialPromiseMap(authorizerNames, addAuthorizer))
 	.then(creationResults => {
 		let index;

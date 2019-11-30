@@ -1,5 +1,127 @@
 # Release history
 
+### 5.11.0 (20 November 2019)
+
+- support for listing deployed versions, using `claudia list`
+
+### 5.10.0 (19 November 2019)
+
+- support for Lambda runtime nodejs12.x
+
+### 5.9.2 (6 November 2019)
+
+- updated docs for create, listing supported regions (thanks to [Claudio Acioli](https://github.com/claudioacioli)).
+
+### 5.9.1 (21 October 2019)
+
+- fixing npm dependency vulnerabilities
+
+### 5.9.0 (17 October 2019)
+
+- support for tagging API Gateway resources (thanks to [Richard Jones](https://github.com/wigsaparelli).
+
+### 5.8.0 (29 August 2019)
+
+- support for adding SNS topic subscription filters
+- support for adding dead letter queues when creating functions
+- support for AWS partitions (making claudia work with aws-us-gov and aws-cn)
+
+### 5.7.0 (15 August 2019)
+
+- support for oauth2 authorization scopes, thanks to [Kevin Coleman](https://github.com/kevintechie).
+
+### 5.6.0 (12 July 2019)
+
+- add option to specify binary media types when deploying a proxy API, thanks to [Primož Verdnik](https://github.com/drye)
+
+### 5.5.0 (14 May 2019)
+
+- nodejs10.x used by default, removed support for node6.10
+- fix deployment to AWS China regions (https://github.com/claudiajs/claudia/issues/187)
+
+### 5.4.2 (22 March 2019)
+
+- support for command line prompts for MFA/STS authentication, thanks to [Grégory Horion](https://github.com/gregory).  
+- upgrade aws-sdk to avoid regression problems with 2.424.0 (https://github.com/aws/aws-sdk-js/issues/2588)
+
+### 5.4.0, 30 January 2019
+
+- support for MFA/STS authentication, thanks to [Grégory Horion](https://github.com/gregory).
+
+### 5.3.0, 27 December 2018
+
+- support for using Lambda Layers. Use `--layers` with `create`, or `--layers`, `--add-layers` and `--remove-layers` with `update`. 
+
+### 5.2.0, 15 November 2018
+
+- allow up to 900 second timeouts with Lambda, thanks to [Steven Chadwick](https://github.com/sschadwick)
+
+### 5.1.2, 25 September 2018
+
+- using 0 as resultTtl for authorisers disables authoriser caching, thanks to [Savramis Sartios](https://github.com/sartios)
+
+### 5.1.0, 19 July 2018
+
+- support for [add-sqs-event-source](https://github.com/claudiajs/claudia/blob/master/docs/add-sqs-event-source.md)
+- better handling of KMS timeouts when creating a function and setting environment variables at the same time
+- removed shelljs as a dependency from the project, which reduces file size and makes it easier to maintain the code
+
+### 5.0.1 
+
+- bug fix for add-cognito-user-pool-trigger, when user pool has custom domain, thanks to [Christian Sepulveda](https://github.com/csepulv)
+- better error handling when a config file is requested for an invalid directory
+
+### 5.0.0 7 June 2018
+
+- use `--npm-options` to pass additional options to NPM when installing packages. Useful to specify behaviour for package locking.
+- packaging using NPM 6 is now faster as audits are turned off by default
+- packaging support for NPM 5 and 6 using relative file dependencies -- this previously worked only with NPM 3 because NPM 5 uses symbolic links for relative references
+- upload size optimised using for NPM 5 and 6 by deduping dependencies after packaging
+- use `--post-package-script=<NPM SCRIPT NAME>` with `claudia create` or `claudia update` to execute a custom post-package step to clean up resources, optimise package size etc. This runs after all validations are complete, and development dependencies are not available at this stage... but you can use npm to uninstall utility tools as part of this step if needed.
+- new command. [`claudia pack`](docs/pack.md) just packages the files, correctly handling NPM dependencies, without deploying anywhere. Useful for troubleshooting, or if you want to deploy to Lambda using some other tool but get Claudia to prepare the package for you. This is specially useful for CloudFormation deployments if you want to use NPM 5 or 6. The command works with any Node.js Lambda project, not just Claudia-specific ones. 
+- claudia automatically fixes file access permissions in your package that would prevent Lambda from running code.
+- NPM output is now directly written to the console, rather than a separate log file, to make packaging errors more obvious
+- (for newly created functions only) claudia destroy will not delete a role if it was created using --role
+
+### 4.0.0 9 April 2018
+
+- compatibility with Node.js 8.10 and NPM 5
+- fix for package-lock.json and --no-optional-dependencies when using NPM 5
+- Claudia now creates new functions using the node8.10 Lambda runtime by default 
+- more resilient waiting on IAM propagation when patching existing roles for VPC access
+
+### 3.4.0 23 March 2018
+
+- added tag command to assist with Lambda tagging, thanks to [Mohamed Osama](https://github.com/oss92)
+
+### 3.3.1 29 January 2018
+
+- bugfix for CORS setup with path params
+- enable generate-serverless-express to handle binary content
+
+### 3.3.0 27 January 2018
+
+- support for using server-side encryption for code uploads to s3, thanks to [Ricky Blaha](https://github.com/rickyblaha)
+
+### 3.2.0 12 January 2018
+
+- support for Kinesis Data Stream triggers with [`add-kinesis-event-source`](docs/add-kinesis-event-source.md)
+
+### 3.1.0 11 January 2018
+
+- support for request based custom API Gateway Authorisers
+
+### 3.0.0 4 January 2018
+
+- support for deploying to Lambda@Edge with [`set-cloudfront-trigger`](docs/set-cloudfront-trigger.md)
+- support for generating quick start projects with [`generate`](docs/generate.md)
+- support for configuring 3GB Lambda functions using `--memory`
+- support for deploying custom [API Gateway Responses](https://github.com/claudiajs/claudia-api-builder/blob/master/docs/customise-responses.md#api-gateway-responses)
+- speed up API GW deployments by using a single handler for CORS OPTIONS instead of replicating it for each supported route
+- fix for deploying lambdas with a VPC configuration and manually specified roles
+
+This release is fully backwards compatible with 2.0 in terms of client code, but changes internal protocols between claudia API Builder and claudia, which is why we increased the major version. For API and bot deployments, this release requires Claudia API Builder 3.0.
+
 ### 2.14.0 23 June 2017
 
 - support for `allow-alexa-skill-trigger` (thanks to [Slobodan Stojanovic](https://github.com/stojanovic))

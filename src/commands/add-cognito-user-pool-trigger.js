@@ -1,7 +1,7 @@
 const loadConfig = require('../util/loadconfig'),
 	iamNameSanitize = require('../util/iam-name-sanitize'),
 	aws = require('aws-sdk'),
-	getOwnerAccount = require('../tasks/get-owner-account-id');
+	getOwnerInfo = require('../tasks/get-owner-info');
 module.exports = function addCognitoUserPoolTrigger(options, optionalLogger) {
 	'use strict';
 	let lambdaConfig,
@@ -36,8 +36,20 @@ module.exports = function addCognitoUserPoolTrigger(options, optionalLogger) {
 			}).promise().then(() => result);
 		},
 		getPoolArn = function () {
-			return getOwnerAccount(optionalLogger)
-				.then(owner => `arn:aws:cognito-idp:${lambdaConfig.region}:${owner}:userpool/${options['user-pool-id']}`);
+			return getOwnerInfo(options.region, optionalLogger)
+				.then(ownerInfo => `arn:${ownerInfo.partition}:cognito-idp:${lambdaConfig.region}:${ownerInfo.account}:userpool/${options['user-pool-id']}`);
+		},
+		cleanUpPoolConfig = function (data) {
+			/* cognito update requires the full config, not just a patch, but some attributes returned
+			 * from describeUserPool are not accepted back into the configuration, so they have to be removed
+			 */
+			['Id', 'Name', 'LastModifiedDate', 'CreationDate', 'SchemaAttributes', 'EstimatedNumberOfUsers', 'AliasAttributes', 'UsernameAttributes', 'Arn', 'Domain'].forEach(n => delete data[n]);
+			if (data.AdminCreateUserConfig && data.AdminCreateUserConfig.UnusedAccountValidityDays) {
+				delete data.AdminCreateUserConfig.UnusedAccountValidityDays;
+			}
+			if (Object.keys(data.UserPoolAddOns || {}).length === 0) {
+				delete data.UserPoolAddOns;
+			}
 		},
 		patchPool = function () {
 			return cognito.describeUserPool({
@@ -47,7 +59,7 @@ module.exports = function addCognitoUserPoolTrigger(options, optionalLogger) {
 				data.UserPoolId = data.Id;
 				data.LambdaConfig = data.LambdaConfig || {};
 				options.events.split(',').forEach(name => data.LambdaConfig[name] = lambdaConfig.arn);
-				['Id', 'Name', 'LastModifiedDate', 'CreationDate', 'SchemaAttributes', 'EstimatedNumberOfUsers', 'AliasAttributes', 'UsernameAttributes'].forEach(n => delete data[n]);
+				cleanUpPoolConfig(data);
 				return cognito.updateUserPool(data).promise();
 			});
 		};

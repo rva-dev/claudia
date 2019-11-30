@@ -67,9 +67,21 @@ describe('Some new feature', function () {
 
 You can run just that one test by executing `npm test -- filter="Some new feature works well"`, or execute all the tests in that same spec bloc by using `npm test -- filter="Some new feature"`
 
-#### Change the remote operation timeout
+#### Filtering tests
 
-By default, tests have 150 seconds to complete before timing out. You might want to change that depending on where you're executing the tests from and what AWS region you're running them in. Do so by changing the TEST_TIMEOUT environment variable before running the tests, and set it to a number of milliseconds. 
+Run a subset of tests by executing `npm test -- filter=<Jasmine Spec Name Filter>`, for example:
+
+* `npm test -- filter="cleanUpPackage"` runs all the tests in the `cleanUpPackage` suite
+* `npm test -- filter="cleanUpPackage fails if npm install fails"` runs a single test called `cleanUpPackage fails if npm install fails`
+
+#### Options for tests
+
+
+* `TEST_TIMEOUT`: (default: 150000) - milliseconds to allow individual tests to run before timing out.
+* `SKIP_AWS`: (default: not set) - set to a non empty string to prevent generic AWS resources from being created for the tests. useful to speed up running individual tests that do not talk to AWS at all
+* `AWS_DEPLOY_RETRIES`: (default: 5) - number of retries to make when deploying AWS resources that might be rate limited.
+* `AWS_DEPLOY_TIMEOUT`: (default: 10000) - milliseconds to pause between retries when deploying AWS resources. 
+* `CLOUDFRONT_DISTRIBUTION_ID`: (default: not set) - cloudfront distribution ID to use for edge deployment tests. if not set, edge deployment tests are skipped
 
 #### Managing environment variables for testing
 
@@ -86,8 +98,8 @@ TEST_TIMEOUT=300000
 
 Here are same house rules for Claudia development. Breaking one of these doesn't necessarily mean that your pull request will not be merged, but following the rules will make it easier and faster to do that. If you decide to break one of these, please explain in the pull request why, so we can revise the rules or adjust the code together.
 
-* AWS Lambda currently supports only Node.js 6.10 and 4.3.2, so we use that one as the baseline for Claudia development. You can use [nvm](https://github.com/creationix/nvm) to manage multiple versions of Node on your development environment if you need to.
-* ES6 code is allowed and encouraged, as long as it works on 4.3.2. We don't use babel for transpilation. 
+* AWS Lambda currently supports only Node.js 10 and 8.10, so we use those ones as the baseline for Claudia development. You can use [nvm](https://github.com/creationix/nvm) to manage multiple versions of Node on your development environment if you need to.
+* ES6 code is allowed and encouraged, as long as it works on Node 8. We don't use babel for transpilation. 
 * We use [Jasmine](https://jasmine.github.io) for tests. 
 * We use `eslint` for linting, with the style guide in [`.eslintrc`](https://github.com/claudiajs/claudia/blob/master/.eslintrc.json)
   * If a particular line of code needs to relax linting rules, use the `//eslint-disable-line` trick instead of disabling it for the whole file

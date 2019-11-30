@@ -1,12 +1,14 @@
 /*global describe, require, it, expect, beforeEach, console */
 const underTest = require('../src/commands/destroy'),
 	create = require('../src/commands/create'),
-	shell = require('shelljs'),
 	retriableWrap = require('../src/util/retriable-wrap'),
 	tmppath = require('../src/util/tmppath'),
 	fs = require('fs'),
 	path = require('path'),
 	aws = require('aws-sdk'),
+	readjson = require('../src/util/readjson'),
+	fsPromise = require('../src/util/fs-promise'),
+	fsUtil = require('../src/util/fs-util'),
 	awsRegion = require('./util/test-aws-region');
 describe('destroy', () => {
 	'use strict';
@@ -14,9 +16,9 @@ describe('destroy', () => {
 	beforeEach(() => {
 		workingdir = tmppath();
 		testRunName = 'test' + Date.now();
-		iam = new aws.IAM();
+		iam = new aws.IAM({ region: awsRegion });
 		newObjects = { workingdir: workingdir };
-		shell.mkdir(workingdir);
+		fs.mkdirSync(workingdir);
 	});
 	it('fails when the source dir does not contain the project config file', done => {
 		underTest({ source: workingdir })
@@ -37,7 +39,7 @@ describe('destroy', () => {
 	});
 	describe('when only a lambda function exists', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/hello-world/*', workingdir);
+			fsUtil.copy('spec/test-projects/hello-world', workingdir, true);
 			create({ name: testRunName, region: awsRegion, source: workingdir, handler: 'main.handler' })
 			.then(result => {
 				newObjects.lambdaFunction = result.lambda && result.lambda.name;
@@ -66,10 +68,22 @@ describe('destroy', () => {
 			.catch(expectedException => expect(expectedException.message).toContain(newObjects.lambdaRole))
 			.then(done, done.fail);
 		});
+		it('keeps the role if it was shared', done => {
+			const configPath = path.join(workingdir, 'claudia.json');
+			readjson(configPath)
+			.then(json => {
+				json.lambda.sharedRole = true;
+				return fsPromise.writeFileAsync(configPath, JSON.stringify(json), 'utf8');
+			})
+			.then(() => underTest({ source: workingdir }))
+			.then(() => iam.getRole({ RoleName: newObjects.lambdaRole }).promise())
+			.then(done, done.fail);
+		});
+
 	});
 	describe('removing the config file', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/hello-world/*', workingdir);
+			fsUtil.copy('spec/test-projects/hello-world', workingdir, true);
 			create({ name: testRunName, region: awsRegion, source: workingdir, handler: 'main.handler' })
 			.then(result => {
 				newObjects.lambdaFunction = result.lambda && result.lambda.name;
@@ -79,16 +93,16 @@ describe('destroy', () => {
 		});
 		it('removes claudia.json if --config is not provided', done => {
 			underTest({ source: workingdir })
-			.then(() => expect(shell.test('-e', path.join(workingdir, 'claudia.json'))).toBeFalsy())
+			.then(() => expect(fs.existsSync(path.join(workingdir, 'claudia.json'))).toBeFalsy())
 			.then(done, done.fail);
 		});
 		it('removes specified config if --config is provided', done => {
 			const otherPath = tmppath();
-			shell.cp(path.join(workingdir, 'claudia.json'), otherPath);
+			fs.writeFileSync(otherPath, fs.readFileSync(path.join(workingdir, 'claudia.json')));
 			underTest({ source: workingdir, config: otherPath})
 			.then(() => {
-				expect(shell.test('-e', path.join(workingdir, 'claudia.json'))).toBeTruthy();
-				expect(shell.test('-e', path.join(workingdir, otherPath))).toBeFalsy();
+				expect(fs.existsSync(path.join(workingdir, 'claudia.json'))).toBeTruthy();
+				expect(fs.existsSync(path.join(workingdir, otherPath))).toBeFalsy();
 			})
 			.then(done, e => {
 				console.log(e.stack || e.message || e);
@@ -98,7 +112,7 @@ describe('destroy', () => {
 	});
 	describe('when the lambda project contains a web api', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/api-gw-hello-world/*', workingdir);
+			fsUtil.copy('spec/test-projects/api-gw-hello-world', workingdir, true);
 			create({ name: testRunName, region: awsRegion, source: workingdir, 'api-module': 'main' })
 			.then(result => {
 				newObjects.lambdaRole = result.lambda && result.lambda.role;
@@ -124,7 +138,7 @@ describe('destroy', () => {
 				return apiGateway.getRestApi({ restApiId: newObjects.restApi }).promise();
 			})
 			.catch(expectedException => {
-				expect(expectedException.message).toEqual('Invalid REST API identifier specified');
+				expect(expectedException.message).toMatch(/^Invalid API identifier specified/);
 				expect(expectedException.code).toEqual('NotFoundException');
 			})
 			.then(done, done.fail);

@@ -1,6 +1,7 @@
 const path = require('path'),
 	validAuthType = require('../util/valid-auth-type'),
-	validCredentials = require('../util/valid-credentials');
+	validCredentials = require('../util/valid-credentials'),
+	CURRENT_API_VERSION = 4;
 module.exports = function validatePackage(dir, functionHandler, restApiModule) {
 	'use strict';
 	const handlerComponents = functionHandler && functionHandler.split('.');
@@ -33,9 +34,13 @@ module.exports = function validatePackage(dir, functionHandler, restApiModule) {
 		if (!apiConfig || !apiConfig.routes || !Object.keys(apiConfig.routes).length) {
 			throw `${apiModulePath}.js does not configure any API methods`;
 		}
-		if (apiConfig.version !== 3) {
-			throw `${apiModulePath}.js uses an unsupported API version. Upgrade your claudia installation`;
+		if (apiConfig.version < CURRENT_API_VERSION) {
+			throw `${apiModulePath}.js uses an unsupported API version. Upgrade your claudia-api-builder or claudia-bot-builder dependency`;
 		}
+		if (apiConfig.version > CURRENT_API_VERSION) {
+			throw `${apiModulePath}.js requires a newer version of claudia. Upgrade your claudia installation`;
+		}
+
 		Object.keys(apiConfig.routes).forEach(route => {
 			const routeConfig = apiConfig.routes[route];
 			Object.keys(routeConfig).forEach(method => {
@@ -71,6 +76,12 @@ module.exports = function validatePackage(dir, functionHandler, restApiModule) {
 				}
 				if (methodConfig.authorizationType && methodConfig.authorizationType !== 'AWS_IAM' && methodConfig.invokeWithCredentials) {
 					throw routeMessage + 'authorization type ' + methodConfig.authorizationType + ' is incompatible with invokeWithCredentials';
+				}
+				if (!methodConfig.cognitoAuthorizer && methodConfig.authorizationScopes) {
+					throw routeMessage + 'authorizer is incompatible with authorizationScopes';
+				}
+				if (methodConfig.authorizationScopes && !Array.isArray(methodConfig.authorizationScopes)) {
+					throw routeMessage + "method parameter 'authorizationScopes' must be an array";
 				}
 			});
 		});

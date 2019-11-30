@@ -11,9 +11,11 @@ module.exports = function destroyObjects(newObjects) {
 	const lambda = new aws.Lambda({ region: awsRegion }),
 		logs = new aws.CloudWatchLogs({ region: awsRegion }),
 		apiGatewayPromise = retriableWrap(new aws.APIGateway({ region: awsRegion })),
-		s3 = new aws.S3(),
+		s3 = new aws.S3({ region: awsRegion }),
 		iot = new aws.Iot({ region: awsRegion }),
 		sns = new aws.SNS({ region: awsRegion }),
+		sqs = new aws.SQS({ region: awsRegion }),
+		iam = new aws.IAM({ region: awsRegion }),
 		events = new aws.CloudWatchEvents({ region: awsRegion }),
 		cognitoIdentityServiceProvider = new aws.CognitoIdentityServiceProvider({ region: awsRegion }),
 		destroyRule = function (ruleName) {
@@ -36,7 +38,69 @@ module.exports = function destroyObjects(newObjects) {
 			return s3.listObjects({Bucket: bucketName}).promise()
 			.then(result => Promise.all(result.Contents.map(deleteSingleObject)))
 			.then(() => s3.deleteBucket({ Bucket: bucketName }).promise());
+		},
+		removeRestApi = () => {
+			if (newObjects.restApi) {
+				return apiGatewayPromise.deleteRestApiPromise({
+					restApiId: newObjects.restApi
+				});
+			}
+		},
+		removeIotRule = () => {
+			if (newObjects.iotTopicRule) {
+				return iot.deleteTopicRule({ruleName: newObjects.iotTopicRule}).promise();
+			}
+		},
+		removeLambdaFunction = () => {
+			if (newObjects.lambdaFunction) {
+				return lambda.deleteFunction({ FunctionName: newObjects.lambdaFunction }).promise();
+			}
+		},
+		removeLambdaLogs = () => {
+			if (newObjects.lambdaFunction) {
+				return logs.deleteLogGroup({ logGroupName: '/aws/lambda/' + newObjects.lambdaFunction }).promise()
+				.catch(() => true);
+			}
+		},
+		removeSnsTopic = () => {
+			if (newObjects.snsTopic) {
+				return sns.deleteTopic({
+					TopicArn: newObjects.snsTopic
+				}).promise();
+			}
+		},
+		removeEventRule = () => {
+			if (newObjects.eventRule) {
+				return destroyRule(newObjects.eventRule);
+			}
+		},
+		removeIamRole = () => {
+			if (newObjects.lambdaRole) {
+				return destroyRole(iam, newObjects.lambdaRole);
+			}
+		},
+		removeCustomLogs = () => {
+			if (newObjects.logGroup) {
+				return logs.deleteLogGroup({ logGroupName: newObjects.logGroup }).promise();
+			}
+		},
+		removeS3Bucket = () => {
+			if (newObjects.s3Bucket) {
+				return destroyBucket(newObjects.s3Bucket);
+			}
+		},
+		removeCognitoPool = () => {
+			if (newObjects.userPoolId) {
+				return cognitoIdentityServiceProvider.deleteUserPool({ UserPoolId: newObjects.userPoolId }).promise();
+			}
+		},
+		removeSQSQueue = () => {
+			if (newObjects.sqsQueueUrl) {
+				return sqs.deleteQueue({QueueUrl: newObjects.sqsQueueUrl}).promise();
+			}
 		};
+
+
 
 	if (!newObjects) {
 		return Promise.resolve();
@@ -46,61 +110,17 @@ module.exports = function destroyObjects(newObjects) {
 		fsUtil.rmDir(newObjects.workingdir);
 	}
 
-	return Promise.resolve()
-	.then(() => {
-		if (newObjects.restApi) {
-			return apiGatewayPromise.deleteRestApiPromise({
-				restApiId: newObjects.restApi
-			});
-		}
-	})
-	.then(() => {
-		if (newObjects.iotTopicRule) {
-			return iot.deleteTopicRule({ruleName: newObjects.iotTopicRule}).promise();
-		}
-	})
-	.then(() => {
-		if (newObjects.lambdaFunction) {
-			return lambda.deleteFunction({ FunctionName: newObjects.lambdaFunction }).promise();
-		}
-	})
-	.then(() => {
-		if (newObjects.lambdaFunction) {
-			return logs.deleteLogGroup({ logGroupName: '/aws/lambda/' + newObjects.lambdaFunction }).promise()
-			.catch(() => true);
-		}
-	})
-	.then(() => {
-		if (newObjects.snsTopic) {
-			return sns.deleteTopic({
-				TopicArn: newObjects.snsTopic
-			}).promise();
-		}
-	})
-	.then(() => {
-		if (newObjects.eventRule) {
-			return destroyRule(newObjects.eventRule);
-		}
-	})
-	.then(() => {
-		if (newObjects.lambdaRole) {
-			return destroyRole(newObjects.lambdaRole);
-		}
-	})
-	.then(() => {
-		if (newObjects.logGroup) {
-			return logs.deleteLogGroup({ logGroupName: newObjects.logGroup }).promise();
-		}
-	})
-	.then(() => {
-		if (newObjects.s3Bucket) {
-			return destroyBucket(newObjects.s3Bucket);
-		}
-	})
-	.then(() => {
-		if (newObjects.userPoolId) {
-			return cognitoIdentityServiceProvider.deleteUserPool({ UserPoolId: newObjects.userPoolId }).promise();
-		}
-	})
-	.catch(e => console.log('error cleaning up', e.stack || e.message || e));
+	return Promise.all([
+		removeRestApi(),
+		removeIotRule(),
+		removeLambdaFunction(),
+		removeLambdaLogs(),
+		removeSnsTopic(),
+		removeEventRule(),
+		removeIamRole(),
+		removeCustomLogs(),
+		removeS3Bucket(),
+		removeCognitoPool(),
+		removeSQSQueue()
+	]).catch(e => console.log('error cleaning up', e.stack || e.message || e));
 };

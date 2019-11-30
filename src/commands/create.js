@@ -1,5 +1,5 @@
 const path = require('path'),
-	sequentialPromiseMap = require('sequential-promise-map'),
+	limits = require('../util/limits.json'),
 	fsUtil = require('../util/fs-util'),
 	aws = require('aws-sdk'),
 	zipdir = require('../tasks/zipdir'),
@@ -7,10 +7,10 @@ const path = require('path'),
 	cleanUpPackage = require('../tasks/clean-up-package'),
 	addPolicy = require('../tasks/add-policy'),
 	markAlias = require('../tasks/mark-alias'),
-	templateFile = require('../util/template-file'),
 	validatePackage = require('../tasks/validate-package'),
 	retriableWrap = require('../util/retriable-wrap'),
 	loggingWrap = require('../util/logging-wrap'),
+	deployProxyApi = require('../tasks/deploy-proxy-api'),
 	rebuildWebApi = require('../tasks/rebuild-web-api'),
 	readjson = require('../util/readjson'),
 	apiGWUrl = require('../util/apigw-url'),
@@ -19,8 +19,16 @@ const path = require('path'),
 	fs = require('fs'),
 	fsPromise = require('../util/fs-promise'),
 	os = require('os'),
+	isRoleArn = require('../util/is-role-arn'),
 	lambdaCode = require('../tasks/lambda-code'),
 	initEnvVarsFromOptions = require('../util/init-env-vars-from-options'),
+	getOwnerInfo = require('../tasks/get-owner-info'),
+	executorPolicy = require('../policies/lambda-executor-policy'),
+	loggingPolicy = require('../policies/logging-policy'),
+	vpcPolicy = require('../policies/vpc-policy'),
+	snsPublishPolicy = require('../policies/sns-publish-policy'),
+	isSNSArn = require('../util/is-sns-arn'),
+	lambdaInvocationPolicy = require('../policies/lambda-invocation-policy'),
 	NullLogger = require('../util/null-logger');
 module.exports = function create(options, optionalLogger) {
 	'use strict';
@@ -30,14 +38,28 @@ module.exports = function create(options, optionalLogger) {
 		functionDesc,
 		customEnvVars,
 		functionName,
+		workingDir,
+		ownerAccount,
+		awsPartition,
 		packageFileDir;
 	const logger = optionalLogger || new NullLogger(),
 		awsDelay = options && options['aws-delay'] && parseInt(options['aws-delay'], 10) || (process.env.AWS_DELAY && parseInt(process.env.AWS_DELAY, 10)) || 5000,
 		awsRetries = options && options['aws-retries'] && parseInt(options['aws-retries'], 10) || 15,
 		source = (options && options.source) || process.cwd(),
 		configFile = (options && options.config) || path.join(source, 'claudia.json'),
-		iam = loggingWrap(new aws.IAM(), {log: logger.logApiCall, logName: 'iam'}),
+		iam = loggingWrap(new aws.IAM({region: options.region}), {log: logger.logApiCall, logName: 'iam'}),
 		lambda = loggingWrap(new aws.Lambda({region: options.region}), {log: logger.logApiCall, logName: 'lambda'}),
+		s3 = loggingWrap(new aws.S3({region: options.region, signatureVersion: 'v4'}), {log: logger.logApiCall, logName: 's3'}),
+		getSnsDLQTopic = function () {
+			const topicNameOrArn = options['dlq-sns'];
+			if (!topicNameOrArn) {
+				return false;
+			}
+			if (isSNSArn(topicNameOrArn)) {
+				return topicNameOrArn;
+			}
+			return `arn:${awsPartition}:sns:${options.region}:${ownerAccount}:${topicNameOrArn}`;
+		},
 		apiGatewayPromise = retriableWrap(
 			loggingWrap(new aws.APIGateway({region: options.region}), {log: logger.logApiCall, logName: 'apigateway'}),
 			() => logger.logStage('rate-limited by AWS, waiting before retry')
@@ -68,6 +90,9 @@ module.exports = function create(options, optionalLogger) {
 			if (!options.handler && options['deploy-proxy-api']) {
 				return 'deploy-proxy-api requires a handler. please specify with --handler';
 			}
+			if (options['binary-media-types'] && !options['deploy-proxy-api']) {
+				return 'binary-media-types only works with --deploy-proxy-api';
+			}
 			if (!options['security-group-ids'] && options['subnet-ids']) {
 				return 'VPC access requires at least one security group id *and* one subnet id';
 			}
@@ -79,6 +104,9 @@ module.exports = function create(options, optionalLogger) {
 			}
 			if (options['api-module'] && options['api-module'].indexOf('.') >= 0) {
 				return 'API module must be a module name, without the file extension or function name';
+			}
+			if (!fsUtil.isDir(path.dirname(configFile))) {
+				return 'cannot write to ' + configFile;
 			}
 			if (fsUtil.fileExists(configFile)) {
 				if (options && options.config) {
@@ -93,11 +121,11 @@ module.exports = function create(options, optionalLogger) {
 				return 'no files match additional policies (' + options.policies + ')';
 			}
 			if (options.memory || options.memory === 0) {
-				if (options.memory < 128) {
-					return 'the memory value provided must be greater than or equal to 128';
+				if (options.memory < limits.LAMBDA.MEMORY.MIN) {
+					return `the memory value provided must be greater than or equal to ${limits.LAMBDA.MEMORY.MIN}`;
 				}
-				if (options.memory > 1536) {
-					return 'the memory value provided must be less than or equal to 1536';
+				if (options.memory > limits.LAMBDA.MEMORY.MAX) {
+					return `the memory value provided must be less than or equal to ${limits.LAMBDA.MEMORY.MAX}`;
 				}
 				if (options.memory % 64 !== 0) {
 					return 'the memory value provided must be a multiple of 64';
@@ -107,9 +135,12 @@ module.exports = function create(options, optionalLogger) {
 				if (options.timeout < 1) {
 					return 'the timeout value provided must be greater than or equal to 1';
 				}
-				if (options.timeout > 300) {
-					return 'the timeout value provided must be less than or equal to 300';
+				if (options.timeout > 900) {
+					return 'the timeout value provided must be less than or equal to 900';
 				}
+			}
+			if (options['allow-recursion'] && options.role && isRoleArn(options.role)) {
+				return 'incompatible arguments allow-recursion and role. When specifying a role ARN, Claudia does not patch IAM policies.';
 			}
 		},
 		getPackageInfo = function () {
@@ -141,19 +172,26 @@ module.exports = function create(options, optionalLogger) {
 						KMSKeyArn: options['env-kms-key-arn'],
 						Handler: options.handler || (options['api-module'] + '.proxyRouter'),
 						Role: roleArn,
-						Runtime: options.runtime || 'nodejs6.10',
+						Runtime: options.runtime || 'nodejs12.x',
 						Publish: true,
+						Layers: options.layers && options.layers.split(','),
 						VpcConfig: options['security-group-ids'] && options['subnet-ids'] && {
 							SecurityGroupIds: (options['security-group-ids'] && options['security-group-ids'].split(',')),
 							SubnetIds: (options['subnet-ids'] && options['subnet-ids'].split(','))
-						}
+						},
+						DeadLetterConfig: getSnsDLQTopic() ? {
+							TargetArn: getSnsDLQTopic()
+						} : null
 					}).promise();
 				},
 				awsDelay, awsRetries,
 				error => {
 					return error &&
 						error.code === 'InvalidParameterValueException' &&
-						error.message === 'The role defined for the function cannot be assumed by Lambda.';
+						(error.message === 'The role defined for the function cannot be assumed by Lambda.'
+						|| error.message.startsWith('The provided execution role does not have permissions')
+						|| error.message.startsWith('Lambda was unable to configure access to your environment variables because the KMS key is invalid for CreateGrant.')
+						);
 				},
 				() => logger.logStage('waiting for IAM role propagation'),
 				Promise
@@ -194,11 +232,10 @@ module.exports = function create(options, optionalLogger) {
 					module: options['api-module'],
 					url: apiGWUrl(result.id, options.region, alias)
 				};
-				return rebuildWebApi(lambdaMetadata.FunctionName, alias, result.id, apiConfig, options.region, logger, options['cache-api-config']);
+				return rebuildWebApi(lambdaMetadata.FunctionName, alias, result.id, apiConfig, ownerAccount, awsPartition, options.region, logger, options['cache-api-config']);
 			})
 			.then(() => {
 				if (apiModule.postDeploy) {
-					Promise.map = sequentialPromiseMap;
 					return apiModule.postDeploy(
 						options,
 						{
@@ -210,8 +247,7 @@ module.exports = function create(options, optionalLogger) {
 						},
 						{
 							apiGatewayPromise: apiGatewayPromise,
-							aws: aws,
-							Promise: Promise
+							aws: aws
 						}
 					);
 				}
@@ -223,30 +259,6 @@ module.exports = function create(options, optionalLogger) {
 				return lambdaMetadata;
 			});
 		},
-		deployProxyApi = function (lambdaMetadata) {
-			const apiConfig = {
-					version: 3,
-					corsHandlers: true,
-					routes: {
-						'{proxy+}': { ANY: {}},
-						'': { ANY: {}}
-					}
-				},
-				alias = options.version || 'latest';
-			logger.logStage('creating REST API');
-
-			return apiGatewayPromise.createRestApiPromise({
-				name: lambdaMetadata.FunctionName
-			})
-			.then(result => {
-				lambdaMetadata.api = {
-					id: result.id,
-					url: apiGWUrl(result.id, options.region, alias)
-				};
-				return rebuildWebApi(lambdaMetadata.FunctionName, alias, result.id, apiConfig, options.region, logger, options['cache-api-config']);
-			})
-			.then(() => lambdaMetadata);
-		},
 		saveConfig = function (lambdaMetaData) {
 			const config = {
 				lambda: {
@@ -255,6 +267,9 @@ module.exports = function create(options, optionalLogger) {
 					region: options.region
 				}
 			};
+			if (options.role) {
+				config.lambda.sharedRole = true;
+			}
 			logger.logStage('saving configuration');
 			if (lambdaMetaData.api) {
 				config.api =  { id: lambdaMetaData.api.id, module: lambdaMetaData.api.module };
@@ -274,6 +289,9 @@ module.exports = function create(options, optionalLogger) {
 					region: options.region
 				}
 			};
+			if (options.role) {
+				config.lambda.sharedRole = true;
+			}
 			if (lambdaMetaData.api) {
 				config.api =  lambdaMetaData.api;
 			}
@@ -281,9 +299,6 @@ module.exports = function create(options, optionalLogger) {
 				config.s3key = s3Key;
 			}
 			return config;
-		},
-		isRoleArn = function (string) {
-			return /^arn:aws:iam:/.test(string);
 		},
 		loadRole = function (functionName) {
 			logger.logStage('initialising IAM role');
@@ -298,54 +313,21 @@ module.exports = function create(options, optionalLogger) {
 				}
 				return iam.getRole({RoleName: options.role}).promise();
 			} else {
-				return fsPromise.readFileAsync(templateFile('lambda-exector-policy.json'), 'utf8')
-					.then(lambdaRolePolicy => {
-						return iam.createRole({
-							RoleName: functionName + '-executor',
-							AssumeRolePolicyDocument: lambdaRolePolicy
-						}).promise();
-					});
+				return iam.createRole({
+					RoleName: functionName + '-executor',
+					AssumeRolePolicyDocument: executorPolicy()
+				}).promise();
 			}
 		},
 		addExtraPolicies = function () {
 			return Promise.all(policyFiles().map(fileName => {
 				const policyName = path.basename(fileName).replace(/[^A-z0-9]/g, '-');
-				return addPolicy(policyName, roleMetadata.Role.RoleName, fileName);
+				return addPolicy(iam, policyName, roleMetadata.Role.RoleName, fileName);
 			}));
-		},
-		vpcPolicy = function () {
-			return JSON.stringify({
-				'Version': '2012-10-17',
-				'Statement': [{
-					'Sid': 'VPCAccessExecutionPermission',
-					'Effect': 'Allow',
-					'Action': [
-						'logs:CreateLogGroup',
-						'logs:CreateLogStream',
-						'logs:PutLogEvents',
-						'ec2:CreateNetworkInterface',
-						'ec2:DeleteNetworkInterface',
-						'ec2:DescribeNetworkInterfaces'
-					],
-					'Resource': '*'
-				}]
-			});
-		},
-		recursivePolicy = function (functionName) {
-			return JSON.stringify({
-				'Version': '2012-10-17',
-				'Statement': [{
-					'Sid': 'InvokePermission',
-					'Effect': 'Allow',
-					'Action': [
-						'lambda:InvokeFunction'
-					],
-					'Resource': 'arn:aws:lambda:' + options.region + ':*:function:' + functionName
-				}]
-			});
 		},
 		cleanup = function (result) {
 			if (!options.keep) {
+				fsUtil.rmDir(workingDir);
 				fs.unlinkSync(packageArchive);
 			} else {
 				result.archive = packageArchive;
@@ -362,7 +344,14 @@ module.exports = function create(options, optionalLogger) {
 		functionName = packageInfo.name;
 		functionDesc = packageInfo.description;
 	})
-	.then(() => collectFiles(source, options['use-local-dependencies'], logger))
+	.then(() => getOwnerInfo(options.region, logger))
+	.then(ownerInfo => {
+		ownerAccount = ownerInfo.account;
+		awsPartition = ownerInfo.partition;
+	})
+	.then(() => fsPromise.mkdtempAsync(os.tmpdir() + path.sep))
+	.then(dir => workingDir = dir)
+	.then(() => collectFiles(source, workingDir, options, logger))
 	.then(dir => {
 		logger.logStage('validating package');
 		return validatePackage(dir, options.handler, options['api-module']);
@@ -384,7 +373,20 @@ module.exports = function create(options, optionalLogger) {
 	})
 	.then(() => {
 		if (!options.role) {
-			return addPolicy('log-writer', roleMetadata.Role.RoleName);
+			return iam.putRolePolicy({
+				RoleName: roleMetadata.Role.RoleName,
+				PolicyName: 'log-writer',
+				PolicyDocument: loggingPolicy(awsPartition)
+			}).promise()
+			.then(() => {
+				if (getSnsDLQTopic()) {
+					return iam.putRolePolicy({
+						RoleName: roleMetadata.Role.RoleName,
+						PolicyName: 'dlq-publisher',
+						PolicyDocument: snsPublishPolicy(getSnsDLQTopic())
+					}).promise();
+				}
+			});
 		}
 	})
 	.then(() => {
@@ -393,7 +395,7 @@ module.exports = function create(options, optionalLogger) {
 		}
 	})
 	.then(() => {
-		if (options['security-group-ids']) {
+		if (options['security-group-ids'] && !isRoleArn(options.role)) {
 			return iam.putRolePolicy({
 				RoleName: roleMetadata.Role.RoleName,
 				PolicyName: 'vpc-access-execution',
@@ -406,11 +408,11 @@ module.exports = function create(options, optionalLogger) {
 			return iam.putRolePolicy({
 				RoleName: roleMetadata.Role.RoleName,
 				PolicyName: 'recursive-execution',
-				PolicyDocument: recursivePolicy(functionName)
+				PolicyDocument: lambdaInvocationPolicy(functionName, awsPartition, options.region)
 			}).promise();
 		}
 	})
-	.then(() => lambdaCode(packageArchive, options['use-s3-bucket'], logger))
+	.then(() => lambdaCode(s3, packageArchive, options['use-s3-bucket'], options['s3-sse']))
 	.then(functionCode => {
 		s3Key = functionCode.S3Key;
 		return createLambda(functionName, functionDesc, functionCode, roleMetadata.Role.Arn);
@@ -420,7 +422,7 @@ module.exports = function create(options, optionalLogger) {
 		if (options['api-module']) {
 			return createWebApi(lambdaMetadata, packageFileDir);
 		} else if (options['deploy-proxy-api']) {
-			return deployProxyApi(lambdaMetadata);
+			return deployProxyApi(lambdaMetadata, options, ownerAccount, awsPartition, apiGatewayPromise, logger);
 		} else {
 			return lambdaMetadata;
 		}
@@ -436,7 +438,7 @@ module.exports.doc = {
 	args: [
 		{
 			argument: 'region',
-			description: 'AWS region where to create the lambda',
+			description: 'AWS region where to create the lambda. For supported values, see\n https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region',
 			example: 'us-east-1'
 		},
 		{
@@ -459,6 +461,15 @@ module.exports.doc = {
 			description: 'If specified, a proxy API will be created for the Lambda \n' +
 				' function on API Gateway, and forward all requests to function. \n' +
 				' This is an alternative way to create web APIs to --api-module.'
+		},
+		{
+			argument: 'binary-media-types',
+			optional: true,
+			description: 'A comma-delimited list of binary-media-types to \n' +
+				'set when using --deploy-proxy-api. Use an empty string in quotes \n' +
+				'to not set any binary media types.',
+			example: 'image/png,image/jpeg',
+			'default': '*/*'
 		},
 		{
 			argument: 'name',
@@ -508,7 +519,7 @@ module.exports.doc = {
 			argument: 'runtime',
 			optional: true,
 			description: 'Node.js runtime to use. For supported values, see\n http://docs.aws.amazon.com/lambda/latest/dg/API_CreateFunction.html',
-			default: 'nodejs6.10'
+			default: 'nodejs12.x'
 		},
 		{
 			argument: 'description',
@@ -539,11 +550,26 @@ module.exports.doc = {
 			description: 'Do not install dependencies, use local node_modules directory instead'
 		},
 		{
+			argument: 'npm-options',
+			optional: true,
+			description: 'Any additional options to pass on to NPM when installing packages. Check https://docs.npmjs.com/cli/install for more information',
+			example: '--ignore-scripts',
+			since: '5.0.0'
+		},
+		{
 			argument: 'cache-api-config',
 			optional: true,
 			example: 'claudiaConfigCache',
 			description: 'Name of the stage variable for storing the current API configuration signature.\n' +
 				'If set, it will also be used to check if the previously deployed configuration can be re-used and speed up deployment'
+		},
+		{
+			argument: 'post-package-script',
+			optional: true,
+			example: 'customNpmScript',
+			description: 'the name of a NPM script to execute custom processing after claudia finished packaging your files.\n' +
+				'Note that development dependencies are not available at this point, but you can use npm uninstall to remove utility tools as part of this step.',
+			since: '5.0.0'
 		},
 		{
 			argument: 'keep',
@@ -556,8 +582,14 @@ module.exports.doc = {
 			optional: true,
 			example: 'claudia-uploads',
 			description: 'The name of a S3 bucket that Claudia will use to upload the function code before installing in Lambda.\n' +
-				'You can use this to upload large functions over slower connections more reliably, and to leave a binary artifact\n' +
-				'after uploads for auditing purposes. If not set, the archive will be uploaded directly to Lambda'
+			'You can use this to upload large functions over slower connections more reliably, and to leave a binary artifact\n' +
+			'after uploads for auditing purposes. If not set, the archive will be uploaded directly to Lambda'
+		},
+		{
+			argument: 's3-sse',
+			optional: true,
+			example: 'AES256',
+			description: 'The type of Server Side Encryption applied to the S3 bucket referenced in `--use-s3-bucket`'
 		},
 		{
 			argument: 'aws-delay',
@@ -604,6 +636,18 @@ module.exports.doc = {
 			argument: 'env-kms-key-arn',
 			optional: true,
 			description: 'KMS Key ARN to encrypt/decrypt environment variables'
+		},
+		{
+			argument: 'layers',
+			optional: true,
+			description: 'A comma-delimited list of Lambda layers to attach to this function',
+			example: 'arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4'
+		},
+		{
+			argument: 'dlq-sns',
+			optional: true,
+			description: 'Dead letter queue SNS topic name or ARN',
+			example: 'arn:aws:sns:us-east-1:123456789012:my_corporate_topic'
 		}
 	]
 };

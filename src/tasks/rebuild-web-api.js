@@ -10,41 +10,26 @@ const aws = require('aws-sdk'),
 	safeHash = require('../util/safe-hash'),
 	flattenRequestParameters = require('./flatten-request-parameters'),
 	patchBinaryTypes = require('./patch-binary-types'),
-	getOwnerId = require('./get-owner-account-id'),
+	clearApi = require('./clear-api'),
 	registerAuthorizers = require('./register-authorizers');
-module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, apiConfig, awsRegion, optionalLogger, configCacheStageVar) {
+module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, apiConfig, ownerAccount, awsPartition, awsRegion, optionalLogger, configCacheStageVar) {
 	'use strict';
-	let existingResources,
-		ownerId,
-		authorizerIds;
+	let authorizerIds;
 	const logger = optionalLogger || new NullLogger(),
 		apiGateway = retriableWrap(
-						loggingWrap(
-							new aws.APIGateway({region: awsRegion}),
-							{log: logger.logApiCall, logName: 'apigateway'}
-						),
-						() => logger.logApiCall('rate-limited by AWS, waiting before retry')),
+			loggingWrap(
+				new aws.APIGateway({region: awsRegion}),
+				{log: logger.logApiCall, logName: 'apigateway'}
+			),
+			() => logger.logApiCall('rate-limited by AWS, waiting before retry')
+		),
 		configHash = safeHash(apiConfig),
 		knownIds = {},
-		findByPath = function (resourceItems, path) {
-			let result;
-			resourceItems.forEach(item => {
-				if (item.path === path) {
-					result = item;
-				}
-			});
-			return result;
-		},
-		getExistingResources = function () {
-			return apiGateway.getResourcesPromise({restApiId: restApiId, limit: 499});
-		},
-		findRoot = function () {
-			const rootResource = findByPath(existingResources, '/');
-			knownIds[''] = rootResource.id;
-			return rootResource.id;
-		},
 		supportsCors = function () {
 			return (apiConfig.corsHandlers !== false);
+		},
+		supportsMockCorsIntegration = function () {
+			return supportsCors && apiConfig.corsHandlers !== true;
 		},
 		putMockIntegration = function (resourceId, httpMethod) {
 			return apiGateway.putIntegrationPromise({
@@ -68,20 +53,26 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				integrationHttpMethod: 'POST',
 				passthroughBehavior: 'WHEN_NO_MATCH',
 				contentHandling: integrationContentHandling,
-				uri: 'arn:aws:apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/arn:aws:lambda:' + awsRegion + ':' + ownerId + ':function:' + functionName + ':${stageVariables.lambdaVersion}/invocations'
+				uri: 'arn:' + awsPartition + ':apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/arn:' + awsPartition + ':lambda:' + awsRegion + ':' + ownerAccount + ':function:' + functionName + ':${stageVariables.lambdaVersion}/invocations'
 			});
 		},
 		corsHeaderValue = function () {
-			const val = apiConfig.corsHeaders || 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token';
+			if (apiConfig.corsHeaders === '') {
+				return '';
+			}
 			if (!supportsCors()) {
 				return '';
 			}
+			const val = apiConfig.corsHeaders || 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token';
 			return '\'' + val + '\'';
 		},
 		createMethod = function (methodName, resourceId, path) {
 			const methodOptions = apiConfig.routes[path][methodName],
 				apiKeyRequired = function () {
 					return methodOptions && methodOptions.apiKeyRequired;
+				},
+				authorizationScopes = function () {
+					return methodOptions && methodOptions.authorizationScopes;
 				},
 				authorizationType = function () {
 					if (methodOptions && methodOptions.authorizationType && validAuthType(methodOptions.authorizationType.toUpperCase())) {
@@ -99,7 +90,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				credentials = function () {
 					if (methodOptions && methodOptions.invokeWithCredentials) {
 						if (methodOptions.invokeWithCredentials === true) {
-							return 'arn:aws:iam::*:user/*';
+							return 'arn:' + awsPartition + ':iam::*:user/*';
 						} else if (validCredentials(methodOptions.invokeWithCredentials)) {
 							return methodOptions.invokeWithCredentials;
 						}
@@ -133,12 +124,13 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				resourceId: resourceId,
 				restApiId: restApiId,
 				requestParameters: parameters,
-				apiKeyRequired: apiKeyRequired()
+				apiKeyRequired: apiKeyRequired(),
+				authorizationScopes: authorizationScopes()
 			})
 			.then(() => putLambdaIntegration(resourceId, methodName, credentials(), parameters && Object.keys(parameters), methodOptions.requestContentHandling))
 			.then(addMethodResponse);
 		},
-		createCorsHandler = function (resourceId) {
+		createCorsHandler = function (resourceId, supportedMethods) {
 			return apiGateway.putMethodPromise({
 				authorizationType: 'NONE',
 				httpMethod: 'OPTIONS',
@@ -146,15 +138,15 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				restApiId: restApiId
 			})
 			.then(() => {
-				if (apiConfig.corsHandlers) {
-					return putLambdaIntegration(resourceId, 'OPTIONS');
-				} else {
+				if (supportsMockCorsIntegration()) {
 					return putMockIntegration(resourceId, 'OPTIONS');
+				} else {
+					return putLambdaIntegration(resourceId, 'OPTIONS');
 				}
 			})
 			.then(() => {
 				let responseParams = null;
-				if (!apiConfig.corsHandlers) {
+				if (supportsMockCorsIntegration()) {
 					responseParams = {
 						'method.response.header.Access-Control-Allow-Headers': false,
 						'method.response.header.Access-Control-Allow-Methods': false,
@@ -173,14 +165,18 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			})
 			.then(() => {
 				let responseParams = null;
+				if (supportsMockCorsIntegration()) {
+					const corsDomain = (supportsMockCorsIntegration() && apiConfig.corsHandlers) || '*',
+						corsHeaders = corsHeaderValue();
 
-				if (!apiConfig.corsHandlers) {
 					responseParams = {
-						'method.response.header.Access-Control-Allow-Headers': corsHeaderValue(),
-						'method.response.header.Access-Control-Allow-Methods': '\'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT\'',
-						'method.response.header.Access-Control-Allow-Origin': '\'*\'',
+						'method.response.header.Access-Control-Allow-Methods': `'OPTIONS,${supportedMethods.sort().join(',')}'`,
+						'method.response.header.Access-Control-Allow-Origin': `'${corsDomain}'`,
 						'method.response.header.Access-Control-Allow-Credentials': '\'true\''
 					};
+					if (corsHeaders) {
+						responseParams['method.response.header.Access-Control-Allow-Headers'] = corsHeaders;
+					}
 					if (apiConfig.corsMaxAge) {
 						responseParams['method.response.header.Access-Control-Max-Age'] = '\'' + apiConfig.corsMaxAge + '\'';
 					}
@@ -214,6 +210,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 		configurePath = function (path) {
 			let resourceId;
 			const supportedMethods = Object.keys(apiConfig.routes[path]),
+				hasCustomCorsHandler = apiConfig.routes[path].OPTIONS,
 				createMethodMapper = function (methodName) {
 					return createMethod(methodName, resourceId, path);
 				};
@@ -223,70 +220,61 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			})
 			.then(() => sequentialPromiseMap(supportedMethods, createMethodMapper))
 			.then(() => {
-				if (supportsCors()) {
-					return createCorsHandler(resourceId);
+				if (!supportsCors() || hasCustomCorsHandler) {
+					return;
 				}
+				return createCorsHandler(resourceId, supportedMethods);
 			});
 		},
-		dropMethods = function (resource) {
-			const dropMethodMapper = function (method) {
-				return apiGateway.deleteMethodPromise({
-					resourceId: resource.id,
-					restApiId: restApiId,
-					httpMethod: method
-				});
+		configureGatewayResponse = function (responseType, responseConfig) {
+			const params = {
+				restApiId: restApiId,
+				responseType: responseType
 			};
-			if (resource.resourceMethods) {
-				return sequentialPromiseMap(Object.keys(resource.resourceMethods), dropMethodMapper);
-			} else {
-				return Promise.resolve();
-			}
-		},
-		removeResource = function (resource) {
-			if (resource.path !== '/') {
-				return apiGateway.deleteResourcePromise({
-					resourceId: resource.id,
-					restApiId: restApiId
-				});
-			} else {
-				return dropMethods(resource);
-			}
-		},
-		dropSubresources = function () {
-			let currentResource;
-			if (existingResources.length === 0) {
-				return Promise.resolve();
-			} else {
-				currentResource = existingResources.pop();
-				return removeResource(currentResource)
-				.then(() => {
-					if (existingResources.length > 0) {
-						return dropSubresources();
-					}
+			if (responseConfig.statusCode) {
+				params.statusCode = String(responseConfig.statusCode);
+			};
+			if (responseConfig.responseParameters) {
+				params.responseParameters = responseConfig.responseParameters;
+			};
+			if (responseConfig.responseTemplates) {
+				params.responseTemplates = responseConfig.responseTemplates;
+			};
+			if (responseConfig.headers) {
+				params.responseParameters = params.responseParameters || {};
+				Object.keys(responseConfig.headers).forEach(header => {
+					params.responseParameters[`gatewayresponse.header.${header}`] = `'${responseConfig.headers[header]}'`;
 				});
 			}
-		},
-		pathSort = function (resA, resB) {
-			if (resA.path > resB.path) {
-				return 1;
-			} else if (resA.path === resB.path) {
-				return 0;
-			}
-			return -1;
+			return apiGateway.putGatewayResponsePromise(params);
+
 		},
 		removeExistingResources = function () {
-			return getExistingResources()
+			return clearApi(apiGateway, restApiId, functionName);
+		},
+		cacheRootId = function () {
+			return apiGateway.getResourcesPromise({restApiId: restApiId, limit: 499})
 			.then(resources => {
-				existingResources = resources.items;
-				existingResources.sort(pathSort);
-				return existingResources;
-			})
-			.then(findRoot)
-			.then(dropSubresources);
+				resources.items.forEach(resource => {
+					const pathWithoutStartingSlash = resource.path.replace(/^\//, '');
+					knownIds[pathWithoutStartingSlash] = resource.id;
+				});
+			});
 		},
 		rebuildApi = function () {
-			return allowApiInvocation(functionName, functionVersion, restApiId, ownerId, awsRegion)
-			.then(() => sequentialPromiseMap(Object.keys(apiConfig.routes), configurePath));
+			return allowApiInvocation(functionName, functionVersion, restApiId, ownerAccount, awsPartition, awsRegion)
+			.then(() => cacheRootId())
+			.then(() => sequentialPromiseMap(Object.keys(apiConfig.routes), configurePath))
+			.then(() => {
+				if (apiConfig.customResponses) {
+					return sequentialPromiseMap(Object.keys(apiConfig.customResponses), responseType => configureGatewayResponse(responseType, apiConfig.customResponses[responseType]));
+				}
+			})
+			.then(() => {
+				if (apiConfig.binaryMediaTypes) {
+					return patchBinaryTypes(restApiId, apiGateway, apiConfig.binaryMediaTypes);
+				}
+			});
 		},
 		deployApi = function () {
 			const stageVars = {
@@ -304,7 +292,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 		},
 		configureAuthorizers = function () {
 			if (apiConfig.authorizers && apiConfig.authorizers !== {}) {
-				return registerAuthorizers(apiConfig.authorizers, restApiId, awsRegion, functionVersion, logger)
+				return registerAuthorizers(apiConfig.authorizers, restApiId, ownerAccount, awsPartition, awsRegion, functionVersion, logger)
 				.then(result => {
 					authorizerIds = result;
 				});
@@ -321,18 +309,13 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 		},
 		getExistingConfigHash = function () {
 			if (!configCacheStageVar) {
-				return false;
+				return Promise.resolve(false);
 			}
 			return apiGateway.getStagePromise({ restApiId: restApiId, stageName: functionVersion })
 				.then(stage => stage.variables && stage.variables[configCacheStageVar])
 				.catch(() => false);
 		};
-	return getOwnerId(logger)
-		.then(accountOwnerId => {
-			ownerId = accountOwnerId;
-		})
-		.then(() => patchBinaryTypes(restApiId, apiGateway, apiConfig.binaryMediaTypes))
-		.then(getExistingConfigHash)
+	return getExistingConfigHash()
 		.then(existingHash => {
 			if (existingHash && existingHash === configHash) {
 				logger.logStage('Reusing cached API configuration');

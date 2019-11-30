@@ -1,57 +1,123 @@
-/*global beforeEach, afterEach, describe, expect, require, console, it, describe */
+/*global beforeEach, afterEach, describe, expect, require, console, it, describe, afterAll */
 const underTest = require('../src/tasks/rebuild-web-api'),
 	destroyObjects = require('./util/destroy-objects'),
 	genericTestRole = require('./util/generic-role'),
 	create = require('../src/commands/create'),
-	shell = require('shelljs'),
 	querystring = require('querystring'),
 	path = require('path'),
 	tmppath = require('../src/util/tmppath'),
 	aws = require('aws-sdk'),
+	fs = require('fs'),
 	callApi = require('../src/util/call-api'),
+	fsUtil = require('../src/util/fs-util'),
 	retriableWrap = require('../src/util/retriable-wrap'),
 	ArrayLogger = require('../src/util/array-logger'),
-	awsRegion = require('./util/test-aws-region');
+	awsRegion = require('./util/test-aws-region'),
+	clearApi = require('../src/tasks/clear-api'),
+	markAlias = require('../src/tasks/mark-alias'),
+	getOwnerInfo = require('../src/tasks/get-owner-info');
 describe('rebuildWebApi', () => {
 	'use strict';
-	let workingdir, testRunName, newObjects, apiId, apiRouteConfig;
+	let workingdir, testRunName, newObjects, apiRouteConfig, apiId, stageName,
+		genericLambdaName, genericLambdaPath, ownerAccount, awsPartition;
 	const apiGateway = retriableWrap(new aws.APIGateway({region: awsRegion})),
+		lambda = new aws.Lambda({region: awsRegion}),
+		createGenericLambda = function (codePath, version) {
+			return Promise.resolve()
+			.then(() => {
+				if (genericLambdaName && genericLambdaPath && genericLambdaPath !== codePath) {
+					return destroyObjects({lambdaFunction: genericLambdaName})
+					.then(() => {
+						genericLambdaName = false;
+						genericLambdaPath = false;
+					});
+				}
+			})
+			.then(() => {
+				if (!genericLambdaName) {
+					fsUtil.copy(codePath, workingdir, true);
+					return create({name: testRunName, version: version, role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
+						genericLambdaName = result.lambda && result.lambda.name;
+						genericLambdaPath = codePath;
+					});
+				} else {
+					return markAlias(genericLambdaName, lambda, '1', version);
+				}
+			});
+
+
+		},
 		invoke = function (url, options) {
 			if (!options) {
 				options = {};
 			}
 			options.retry = 403;
 			return callApi(apiId, awsRegion, url, options);
+		},
+		getCustomGatewayResponses = function () {
+			return apiGateway.getGatewayResponsesPromise({ restApiId: apiId })
+			.then(result => result.items.filter(f => !f.defaultResponse));
+		},
+		getResourceForPath = function (path) {
+			return apiGateway.getResourcesPromise({
+				restApiId: apiId
+			})
+			.then(resources => {
+				const resource = resources.items.find(resource => (resource.path === path));
+				return resource && resource.id;
+			});
 		};
-	beforeEach(() => {
+	beforeAll(done => {
+		getOwnerInfo()
+		.then(ownerInfo => {
+			ownerAccount = ownerInfo.account;
+			awsPartition = ownerInfo.partition;
+		})
+		.then(done, done.fail);
+	});
+	afterAll(done => {
+		destroyObjects({restApi: apiId, lambdaFunction: genericLambdaName}).then(done, done.fail);
+	});
+
+
+	beforeEach(done => {
 		workingdir = tmppath();
 		testRunName = 'test' + Date.now();
 		newObjects = {workingdir: workingdir};
-		shell.mkdir(workingdir);
-		apiRouteConfig = {version: 3, routes: { echo: {'GET': {} } }};
+		fs.mkdirSync(workingdir);
+		apiRouteConfig = {version: 4, routes: { echo: {'GET': {} } }};
+		stageName = `original${Date.now()}`;
+		if (!apiId) {
+			apiGateway.createRestApiPromise({name: 'generic-api'})
+			.then(result => {
+				apiId = result.id;
+			})
+			.then(done, done.fail);
+		} else {
+			clearApi(apiGateway, apiId, testRunName)
+			.then(done, done.fail);
+		}
 	});
 	afterEach(done => {
-		destroyObjects(newObjects).then(done, done.fail);
+		const cleanApiStage =  apiId &&
+			apiGateway.deleteStagePromise({
+				restApiId: apiId,
+				stageName: stageName
+			}).catch(() => false);
+		Promise.all([cleanApiStage, destroyObjects(newObjects)]).then(done, done.fail);
 	});
 	describe('when working with a blank api', () => {
+
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/apigw-proxy-echo/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
 			apiRouteConfig.corsHandlers = false;
+
+			createGenericLambda('spec/test-projects/apigw-proxy-echo', stageName)
+			.then(done, done.fail);
 		});
 		it('creates and links an API to a lambda version', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo');
+				return invoke(`${stageName}/echo`);
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
@@ -60,9 +126,9 @@ describe('rebuildWebApi', () => {
 		});
 		describe('request parameter processing', () => {
 			it('captures query string parameters', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo?name=mike&' + encodeURIComponent('to=m') + '=' + encodeURIComponent('val,a=b'));
+					return invoke(`${stageName}/echo?name=mike&` + encodeURIComponent('to=m') + '=' + encodeURIComponent('val,a=b'));
 				}).then(contents => {
 					const params = JSON.parse(contents.body);
 					expect(params.queryStringParameters).toEqual({name: 'mike', 'to=m': 'val,a=b'});
@@ -72,9 +138,9 @@ describe('rebuildWebApi', () => {
 				});
 			});
 			it('captures quoted query string parameters', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo?name=O\'Reilly');
+					return invoke(`${stageName}/echo?name=O'Reilly`);
 				}).then(contents => {
 					const params = JSON.parse(contents.body);
 					expect(params.queryStringParameters).toEqual({name: 'O\'Reilly'});
@@ -85,9 +151,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures path parameters', done => {
 				apiRouteConfig.routes['people/{personId}'] = {'GET': {} };
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/people/Marcus');
+					return invoke(`${stageName}/people/Marcus`);
 				}).then(contents => {
 					const params = JSON.parse(contents.body);
 					expect(params.pathParameters.personId).toEqual('Marcus');
@@ -96,9 +162,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures path parameters with quotes', done => {
 				apiRouteConfig.routes['people/{personId}'] = {'GET': {} };
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/people/Mar\'cus');
+					return invoke(`${stageName}/people/Mar'cus`);
 				}).then(contents => {
 					const params = JSON.parse(contents.body);
 					expect(params.pathParameters.personId).toEqual('Mar\'cus');
@@ -106,9 +172,9 @@ describe('rebuildWebApi', () => {
 
 			});
 			it('captures headers', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(`${stageName}/echo`, {
 						headers: {'auth-head': 'auth3-val', 'Capital-Head': 'Capital-Val'}
 					});
 				}).then(contents => {
@@ -118,9 +184,9 @@ describe('rebuildWebApi', () => {
 				}).then(done, done.fail);
 			});
 			it('captures headers with quotes', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(`${stageName}/echo`, {
 						headers: {'auth-head': 'auth3\'val', 'Capital-Head': 'Capital\'Val'}
 					});
 				}).then(contents => {
@@ -130,13 +196,13 @@ describe('rebuildWebApi', () => {
 				}).then(done, done.fail);
 			});
 			it('captures stage variables', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
 					return apiGateway.createDeploymentPromise({
 						restApiId: apiId,
 						stageName: 'fromtest',
 						variables: {
-							lambdaVersion: 'original',
+							lambdaVersion: stageName,
 							authKey: 'abs123',
 							authBucket: 'bucket123'
 						}
@@ -147,16 +213,16 @@ describe('rebuildWebApi', () => {
 				}).then(contents => {
 					const params = JSON.parse(contents.body);
 					expect(params.stageVariables).toEqual({
-						lambdaVersion: 'original',
+						lambdaVersion: stageName,
 						authKey: 'abs123',
 						authBucket: 'bucket123'
 					});
 				}).then(done, done.fail);
 			});
 			it('captures form post variables', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'content-type': 'application/x-www-form-urlencoded'},
 						body: querystring.stringify({name: 'tom', surname: 'bond'}),
 						method: 'POST'
@@ -168,9 +234,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures quoted form POST variables correctly', done => {
 				const body = 'first_name=Jobin\'s&receiver_email=xxx@yyy.com&address_country_code=CA&payer_business_name=Jobin\'s Services&address_state=Quebec';
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'content-type': 'application/x-www-form-urlencoded'},
 						body: body,
 						method: 'POST'
@@ -185,9 +251,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures text/xml request bodies', done => {
 				const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<test>1234</test>';
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'Content-Type': 'text/xml'},
 						body: xml,
 						method: 'POST'
@@ -199,9 +265,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures application/xml request bodies', done => {
 				const xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<test>1234</test>';
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'Content-Type': 'application/xml'},
 						body: xml,
 						method: 'POST'
@@ -213,9 +279,9 @@ describe('rebuildWebApi', () => {
 			});
 			it('captures text/plain request bodies', done => {
 				const textContent = 'this is just plain text';
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'Content-Type': 'text/plain'},
 						body: textContent,
 						method: 'POST'
@@ -228,9 +294,9 @@ describe('rebuildWebApi', () => {
 
 			it('captures quoted text/plain request bodies', done => {
 				const textContent = 'this is single \' quote';
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'Content-Type': 'text/plain'},
 						body: textContent,
 						method: 'POST'
@@ -246,9 +312,9 @@ describe('rebuildWebApi', () => {
 						license: {version: 2, accountType: 'mindmup-gold', account: 'dave', signature: 'signature-1'}
 					},
 					textContent = JSON.stringify(jsonContent);
-				underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {'echo': { 'POST': {}}}}, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						headers: {'Content-Type': 'application/json'},
 						body: textContent,
 						method: 'POST'
@@ -261,21 +327,21 @@ describe('rebuildWebApi', () => {
 		});
 
 		it('creates multiple methods for the same resource', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {echo: { GET: {}, POST: {}, PUT: {}}}}, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {echo: { GET: {}, POST: {}, PUT: {}}}}, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo');
+				return invoke(stageName + '/echo');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/echo', {method: 'POST'});
+				return invoke(stageName + '/echo', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/echo', {method: 'PUT'});
+				return invoke(stageName + '/echo', {method: 'PUT'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('PUT');
@@ -283,21 +349,21 @@ describe('rebuildWebApi', () => {
 			}).then(done, done.fail);
 		});
 		it('maps ANY method', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 3, routes: {echo: { ANY: {}}}}, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 3, routes: {echo: { ANY: {}}}}, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo');
+				return invoke(stageName + '/echo');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/echo', {method: 'POST'});
+				return invoke(stageName + '/echo', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/echo', {method: 'PUT'});
+				return invoke(stageName + '/echo', {method: 'PUT'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('PUT');
@@ -312,27 +378,27 @@ describe('rebuildWebApi', () => {
 			apiRouteConfig.routes['echo/sub/res'] = {POST: {}};
 			apiRouteConfig.routes['echo/hello'] = {POST: {}};
 			apiRouteConfig.routes['sub/hello'] = {POST: {}};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo');
+				return invoke(stageName + '/echo');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/echo/sub/res', {method: 'POST'});
+				return invoke(stageName + '/echo/sub/res', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/echo/sub/res');
 			}).then(() => {
-				return invoke('original/sub/hello', {method: 'POST'});
+				return invoke(stageName + '/sub/hello', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/sub/hello');
 			}).then(() => {
-				return invoke('original/echo/hello', {method: 'POST'});
+				return invoke(stageName + '/echo/hello', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
@@ -345,7 +411,7 @@ describe('rebuildWebApi', () => {
 		it('sets apiKeyRequired if requested', done => {
 			let echoResourceId;
 			apiRouteConfig.routes.echo.POST = {apiKeyRequired: true};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -378,7 +444,7 @@ describe('rebuildWebApi', () => {
 		it('sets authorizationType if requested', done => {
 			let echoResourceId;
 			apiRouteConfig.routes.echo.POST = {authorizationType: 'AWS_IAM'};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -413,7 +479,7 @@ describe('rebuildWebApi', () => {
 			apiRouteConfig.routes.echo.POST = {
 				invokeWithCredentials: true
 			};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -452,7 +518,7 @@ describe('rebuildWebApi', () => {
 				apiRouteConfig.routes.echo.POST = {
 					invokeWithCredentials: testCredentials
 				};
-				return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion);
+				return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion);
 			}).then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -487,7 +553,7 @@ describe('rebuildWebApi', () => {
 			apiRouteConfig.routes.echo.POST = {
 				invokeWithCredentials: 'invalid_credentials'
 			};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -521,27 +587,27 @@ describe('rebuildWebApi', () => {
 			apiRouteConfig.routes['hello/res'] = {POST: {}};
 			apiRouteConfig.routes.hello = {POST: {}};
 			apiRouteConfig.routes[''] = {GET: {}};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo');
+				return invoke(stageName + '/echo');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
 				expect(params.requestContext.resourcePath).toEqual('/echo');
 			}).then(() => {
-				return invoke('original/hello', {method: 'POST'});
+				return invoke(stageName + '/hello', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/hello');
 			}).then(() => {
-				return invoke('original/hello/res', {method: 'POST'});
+				return invoke(stageName + '/hello/res', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/hello/res');
 			}).then(() => {
-				return invoke('original/');
+				return invoke(stageName + '/');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
@@ -552,19 +618,148 @@ describe('rebuildWebApi', () => {
 			});
 		});
 	});
+	describe('custom gateway response support', () => {
+		beforeEach(done => {
+			apiRouteConfig.corsHandlers = false;
+			createGenericLambda('spec/test-projects/apigw-proxy-echo', stageName)
+			.then(done, done.fail);
+		});
+		afterEach(done => {
+			const oldApiId = apiId;
+			apiId = false;
+			destroyObjects({restApi: oldApiId}).then(done, done.fail);
+		});
+		it('does not add any custom responses by default', done => {
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => getCustomGatewayResponses())
+			.then(result => expect(result).toEqual([]))
+			.then(done, done.fail);
+		});
+		it('adds new custom gateway responses if required', done => {
+			apiRouteConfig.customResponses = {'DEFAULT_4XX': {statusCode: 411}};
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => getCustomGatewayResponses())
+			.then(result => {
+				expect(result.length).toEqual(1);
+				expect(result[0].responseType).toEqual('DEFAULT_4XX');
+				expect(result[0].statusCode).toEqual('411');
+			})
+			.then(() => {
+				return invoke(stageName + '/non-existing', {resolveErrors: true});
+			}).then(response => {
+				expect(response.statusCode).toEqual(411);
+			}).then(done, done.fail);
+		});
+		it('adds multiple custom gateway responses', done => {
+			const sortByResponseType = function (a, b) {
+				if (a.responseType < b.responseType) {
+					return -1;
+				}
+				if (a.responseType > b.responseType) {
+					return 1;
+				}
+				return 0;
+			};
+			apiRouteConfig.customResponses = {'DEFAULT_4XX': {statusCode: 411}, 'DEFAULT_5XX': {statusCode: 511}};
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => getCustomGatewayResponses())
+			.then(result => {
+				result.sort(sortByResponseType);
+				expect(result.length).toEqual(2);
+				expect(result[0].responseType).toEqual('DEFAULT_4XX');
+				expect(result[0].statusCode).toEqual('411');
+				expect(result[1].responseType).toEqual('DEFAULT_5XX');
+				expect(result[1].statusCode).toEqual('511');
+			})
+			.then(() => {
+				return invoke(stageName + '/non-existing', {resolveErrors: true});
+			}).then(response => {
+				expect(response.statusCode).toEqual(411);
+			}).then(done, done.fail);
+		});
+		it('adds response parameters', done => {
+			apiRouteConfig.customResponses = {
+				'DEFAULT_4XX': {
+					responseParameters: {
+						'gatewayresponse.header.x-response-claudia': '\'yes\'',
+						'gatewayresponse.header.x-name': 'method.request.header.name',
+						'gatewayresponse.header.Access-Control-Allow-Origin': '\'a.b.c\'',
+						'gatewayresponse.header.Content-Type': '\'application/json\''
+					},
+					statusCode: 411,
+					responseTemplates: {
+						'application/json': '{"custom": true, "message":$context.error.messageString}'
+					}
+				}
+			};
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => invoke(stageName + '/non-existing?key=tom', {
+				headers: {'name': 'tom'},
+				resolveErrors: true
+			}))
+			.then(response => {
+				const bodyJson = JSON.parse(response.body);
+				expect(bodyJson.custom).toEqual(true);
+				expect(bodyJson.message).toEqual('Missing Authentication Token');
+				expect(response.statusCode).toEqual(411);
+				expect(response.headers['content-type']).toEqual('application/json');
+				expect(response.headers['access-control-allow-origin']).toEqual('a.b.c');
+				expect(response.headers['x-response-claudia']).toEqual('yes');
+				expect(response.headers['x-name']).toEqual('tom');
+			})
+			.then(done, done.fail);
+		});
+		it('works with a headers shortcut', done => {
+			apiRouteConfig.customResponses = {
+				'DEFAULT_4XX': {
+					headers: {
+						'x-response-claudia': 'yes',
+						'Content-Type': 'application/json',
+						'Access-Control-Allow-Origin': 'a.b.c'
+					}
+				}
+			};
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => invoke(stageName + '/non-existing', { resolveErrors: true }))
+			.then(response => {
+				expect(response.headers['content-type']).toEqual('application/json');
+				expect(response.headers['access-control-allow-origin']).toEqual('a.b.c');
+				expect(response.headers['x-response-claudia']).toEqual('yes');
+			})
+			.then(done, done.fail);
+		});
+		it('can combine responseParameters and headers', done => {
+			apiRouteConfig.customResponses = {
+				'DEFAULT_4XX': {
+					responseParameters: {
+						'gatewayresponse.header.x-response-claudia': '\'yes\'',
+						'gatewayresponse.header.x-name': 'method.request.header.name'
+					},
+					headers: {
+						'x-response-claudia': 'no',
+						'Content-Type': 'application/json',
+						'Access-Control-Allow-Origin': 'a.b.c'
+					},
+					statusCode: 411
+				}
+			};
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+			.then(() => invoke(stageName + '/non-existing?key=tom', {
+				headers: {'name': 'tom'},
+				resolveErrors: true
+			}))
+			.then(response => {
+				expect(response.headers['content-type']).toEqual('application/json');
+				expect(response.headers['access-control-allow-origin']).toEqual('a.b.c');
+				expect(response.headers['x-response-claudia']).toEqual('no');
+				expect(response.headers['x-name']).toEqual('tom');
+
+			})
+			.then(done, done.fail);
+		});
+	});
 	describe('binary media type support', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/api-gw-binary/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
 			apiRouteConfig = {
 				version: 3,
 				routes: {
@@ -572,9 +767,11 @@ describe('rebuildWebApi', () => {
 				},
 				corsHandlers: false
 			};
+			createGenericLambda('spec/test-projects/api-gw-binary', stageName)
+			.then(done, done.fail);
 		});
 		it('does not install any binary media support to an API if no specific types are requested', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getRestApiPromise({restApiId: apiId}))
 			.then(restApiConfig => {
 				expect(restApiConfig.binaryMediaTypes).toBeUndefined();
@@ -582,7 +779,7 @@ describe('rebuildWebApi', () => {
 		});
 		it('installs configured binary media type support if an API contains binaryMediaTypes', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/x-markdown', 'image/tiff'];
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getRestApiPromise({restApiId: apiId}))
 			.then(restApiConfig => {
 				expect(restApiConfig.binaryMediaTypes).toEqual(['application/x-markdown', 'image/tiff']);
@@ -590,14 +787,14 @@ describe('rebuildWebApi', () => {
 		});
 		it('does not add any types if binaryMediaTypes is an empty array', done => {
 			apiRouteConfig.binaryMediaTypes = [];
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getRestApiPromise({restApiId: apiId}))
 			.then(restApiConfig => {
 				expect(restApiConfig.binaryMediaTypes).toBeUndefined();
 			}).then(done, done.fail);
 		});
 		it('does not set up base64 encoding or decoding by default', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getResourcesPromise({restApiId: apiId}))
 			.then(resources => resources.items.find(resource => resource.path === '/echo').id)
 			.then(resourceId => apiGateway.getMethodPromise({restApiId: apiId, httpMethod: 'POST', resourceId: resourceId}))
@@ -609,7 +806,7 @@ describe('rebuildWebApi', () => {
 		});
 		it('allows the api configuration to override set content handling with requestContentHandling', done => {
 			apiRouteConfig.routes.echo.POST.requestContentHandling = 'CONVERT_TO_BINARY';
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getResourcesPromise({restApiId: apiId}))
 			.then(resources => resources.items.find(resource => resource.path === '/echo').id)
 			.then(resourceId => apiGateway.getMethodPromise({restApiId: apiId, httpMethod: 'POST', resourceId: resourceId}))
@@ -619,7 +816,7 @@ describe('rebuildWebApi', () => {
 		});
 		it('allows the api configuration to set response content handling with responseContentHandling', done => {
 			apiRouteConfig.routes.echo.POST.success = { contentHandling: 'CONVERT_TO_TEXT' };
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => apiGateway.getResourcesPromise({restApiId: apiId}))
 			.then(resources => resources.items.find(resource => resource.path === '/echo').id)
 			.then(resourceId => apiGateway.getMethodPromise({restApiId: apiId, httpMethod: 'POST', resourceId: resourceId}))
@@ -629,109 +826,102 @@ describe('rebuildWebApi', () => {
 		});
 		it('converts recognised binary content types into base64 text', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/octet-stream', 'image/png'];
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
-					body: 'Hello World',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
+						body: 'Hello World',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
+				}).then(done, done.fail);
 		});
 		it('converts recognised binary content types into base64 when requestContentHandling is CONVERT_TO_TEXT', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/octet-stream', 'image/png'];
 			apiRouteConfig.routes.echo.POST.requestContentHandling = 'CONVERT_TO_TEXT';
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
-					body: 'Hello World',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
+						body: 'Hello World',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
+				}).then(done, done.fail);
 		});
 		it('does not convert if content type is not recognised as binary', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/x-markdown', 'image/tiff'];
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
-					body: 'Hello World',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('Hello World');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
+						body: 'Hello World',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('Hello World');
+				}).then(done, done.fail);
 		});
 		it('does not convert when requestContentHandling is set to CONVERT_TO_BINARY', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/octet-stream', 'image/png'];
 			apiRouteConfig.routes.echo.POST.requestContentHandling = 'CONVERT_TO_BINARY';
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
-					body: 'Hello World',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'content-type': 'application/octet-stream', 'result-content-type': 'text/plain'},
+						body: 'Hello World',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
+				}).then(done, done.fail);
 		});
 		it('sets up the API to convert base64 results to binary', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/octet-stream', 'image/png'];
 			apiRouteConfig.routes.echo.POST.success = { contentHandling: 'CONVERT_TO_BINARY' };
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'Content-Type': 'text/plain', 'result-encoded': 'true', 'accept': 'image/png', 'result-content-type': 'image/png'},
-					body: 'SGVsbG8gV29ybGQ=',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('Hello World');
-				expect(contents.headers['content-type']).toEqual('image/png');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'Content-Type': 'text/plain', 'result-encoded': 'true', 'accept': 'image/png', 'result-content-type': 'image/png'},
+						body: 'SGVsbG8gV29ybGQ=',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('Hello World');
+					expect(contents.headers['content-type']).toEqual('image/png');
+				}).then(done, done.fail);
 		});
 		it('does not convert to binary unless the encoding flag is set', done => {
 			apiRouteConfig.binaryMediaTypes = ['application/octet-stream', 'image/png'];
 			apiRouteConfig.routes.echo.POST.success = { contentHandling: 'CONVERT_TO_BINARY' };
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
-			.then(() => {
-				return invoke('original/echo', {
-					headers: {'Content-Type': 'text/plain', 'accept': 'image/png', 'result-content-type': 'image/png'},
-					body: 'SGVsbG8gV29ybGQ=',
-					method: 'POST'
-				});
-			}).then(contents => {
-				expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
-				expect(contents.headers['content-type']).toEqual('image/png');
-			}).then(done, done.fail);
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {
+						headers: {'Content-Type': 'text/plain', 'accept': 'image/png', 'result-content-type': 'image/png'},
+						body: 'SGVsbG8gV29ybGQ=',
+						method: 'POST'
+					});
+				}).then(contents => {
+					expect(contents.body).toEqual('SGVsbG8gV29ybGQ=');
+					expect(contents.headers['content-type']).toEqual('image/png');
+				}).then(done, done.fail);
 		});
 	});
 	describe('custom authorizers', () => {
 		let authorizerLambdaName;
 		beforeEach(done => {
 			const authorizerLambdaDir = path.join(workingdir, 'authorizer');
-
-			shell.mkdir('-p', workingdir);
-			shell.mkdir('-p', authorizerLambdaDir);
-			shell.cp('-r', 'spec/test-projects/echo/*', workingdir);
-			shell.cp('-r', 'spec/test-projects/echo/*', authorizerLambdaDir);
+			fs.mkdirSync(authorizerLambdaDir);
+			fsUtil.copy('spec/test-projects/echo', workingdir, true);
+			fsUtil.copy('spec/test-projects/echo', authorizerLambdaDir, true);
 
 			apiRouteConfig.corsHandlers = false;
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
+			create({name: testRunName, version: stageName, role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
+				genericLambdaName = result.lambda && result.lambda.name;
 			}).then(() => {
-				return apiGateway.createRestApiPromise({name: testRunName});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(() => {
-				return create({name: testRunName + 'auth', version: 'original', role: genericTestRole.get(), region: awsRegion, source: authorizerLambdaDir, handler: 'main.handler'});
+				return create({name: testRunName + 'auth', version: stageName, role: genericTestRole.get(), region: awsRegion, source: authorizerLambdaDir, handler: 'main.handler'});
 			}).then(result => {
 				authorizerLambdaName = result.lambda && result.lambda.name;
 			}).then(done, done.fail);
@@ -748,7 +938,7 @@ describe('rebuildWebApi', () => {
 				second: { lambdaName: authorizerLambdaName, headerName: 'UserId' }
 			};
 			apiRouteConfig.routes.echo.POST = {customAuthorizer: 'second'};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -791,73 +981,160 @@ describe('rebuildWebApi', () => {
 
 	describe('CORS handling', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/api-gw-proxy-headers/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
-
+			createGenericLambda('spec/test-projects/api-gw-proxy-headers', stageName)
+			.then(done, done.fail);
 		});
-
 		describe('without custom CORS options', () => {
 			it('creates OPTIONS handlers for CORS', done => {
 				apiRouteConfig.routes.hello = {POST: {}, GET: {}};
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {method: 'OPTIONS'});
+					return invoke(stageName + '/echo', {method: 'OPTIONS'});
 				}).then(contents => {
-					expect(contents.headers['access-control-allow-methods']).toEqual('DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT');
+					expect(contents.headers['access-control-allow-methods']).toEqual('OPTIONS,GET');
 					expect(contents.headers['access-control-allow-headers']).toEqual('Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token');
 					expect(contents.headers['access-control-allow-origin']).toEqual('*');
 					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
 					expect(contents.headers['access-control-max-age']).toBeUndefined();
 				}).then(() => {
-					return invoke('original/hello', {method: 'OPTIONS'});
+					return invoke(stageName + '/hello', {method: 'OPTIONS'});
 				}).then(contents => {
-					expect(contents.headers['access-control-allow-methods']).toEqual('DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT');
+					expect(contents.headers['access-control-allow-methods']).toEqual('OPTIONS,GET,POST');
 					expect(contents.headers['access-control-allow-headers']).toEqual('Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token');
 					expect(contents.headers['access-control-allow-origin']).toEqual('*');
 					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
 					expect(contents.headers['access-control-max-age']).toBeUndefined();
 				}).then(done, done.fail);
 			});
+			it('creates a MOCK integration for performance', done => {
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/echo'))
+				.then(resourceId => {
+					return apiGateway.getIntegrationPromise({
+						httpMethod: 'OPTIONS',
+						resourceId: resourceId,
+						restApiId: apiId
+					});
+				}).then(response => {
+					expect(response.type).toEqual('MOCK');
+				}).then(done, done.fail);
+			});
+			it('can create CORS handlers for APIs with param paths -- regression check', done => {
+				apiRouteConfig.routes['{owner}'] = {GET: {}};
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {method: 'OPTIONS'});
+				}).then(contents => {
+					expect(contents.headers['access-control-allow-methods']).toEqual('OPTIONS,GET');
+					expect(contents.headers['access-control-allow-headers']).toEqual('Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token');
+					expect(contents.headers['access-control-allow-origin']).toEqual('*');
+					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
+					expect(contents.headers['access-control-max-age']).toBeUndefined();
+				}).then(done, done.fail);
+			});
+			it('allows a custom OPTIONS handler to take over execution completely for CORS', done => {
+				apiRouteConfig.routes.manual = {POST: {}, OPTIONS: {}};
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/manual'))
+				.then(resourceId => {
+					return apiGateway.getIntegrationPromise({
+						httpMethod: 'OPTIONS',
+						resourceId: resourceId,
+						restApiId: apiId
+					});
+				}).then(response => {
+					expect(response.type).toEqual('AWS_PROXY');
+				}).then(() => {
+					return invoke(stageName + '/manual', {
+						method: 'OPTIONS',
+						headers: {'content-type': 'text/plain'},
+						body: JSON.stringify({
+							'Access-Control-Allow-Methods': 'GET,OPTIONS',
+							'Access-Control-Allow-Headers': 'X-Custom-Header,X-Api-Key',
+							'Access-Control-Allow-Origin': 'custom-origin',
+							'Access-Control-Allow-credentials': 'c1-false'
+						})
+					});
+				}).then(contents => {
+					expect(contents.headers['access-control-allow-methods']).toEqual('GET,OPTIONS');
+					expect(contents.headers['access-control-allow-headers']).toEqual('X-Custom-Header,X-Api-Key');
+					expect(contents.headers['access-control-allow-origin']).toEqual('custom-origin');
+					expect(contents.headers['access-control-allow-credentials']).toEqual('c1-false');
+				}).then(done, done.fail);
+			});
 		});
 		describe('when corsHeaders are set', () => {
-			beforeEach(() => {
-				apiRouteConfig.corsHeaders = 'X-Custom-Header,X-Api-Key';
-			});
 			it('uses the headers for OPTIONS handlers', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				apiRouteConfig.corsHeaders = 'X-Custom-Header,X-Api-Key';
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 				.then(() => {
-					return invoke('original/echo', {method: 'OPTIONS'});
+					return invoke(stageName + '/echo', {method: 'OPTIONS'});
 				}).then(contents => {
 					expect(contents.headers['access-control-allow-headers']).toEqual('X-Custom-Header,X-Api-Key');
 					expect(contents.headers['access-control-allow-origin']).toEqual('*');
 					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
 				}).then(done, done.fail);
 			});
+			it('uses the headers for OPTIONS handlers even when blank string', done => {
+				apiRouteConfig.corsHeaders = '';
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => {
+					return invoke(stageName + '/echo', {method: 'OPTIONS'});
+				}).then(contents => {
+					expect(contents.headers['access-control-allow-headers']).toBeUndefined();
+					expect(contents.headers['access-control-allow-origin']).toEqual('*');
+					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
+				}).then(done, done.fail);
+			});
 		});
 		describe('when corsHandlers are set to false', () => {
-			beforeEach(done => {
-				apiRouteConfig.corsHandlers = false;
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion).then(done, done.fail);
-			});
-			it('does not create OPTIONS handlers for CORS', done => {
-				invoke('original/echo', {method: 'OPTIONS', resolveErrors: true})
-				.then(response => {
-					expect(response.statusCode).toEqual(403);
-					expect(response.headers['content-type']).toEqual('application/json');
-					expect(response.headers['access-control-allow-methods']).toBeFalsy();
-					expect(response.headers['access-control-allow-headers']).toBeFalsy();
-					expect(response.headers['access-control-allow-origin']).toBeFalsy();
-					expect(response.headers['access-control-allow-credentials']).toBeFalsy();
+			beforeEach(() => {
 
+				apiRouteConfig.corsHandlers = false;
+
+			});
+			it('does not create any OPTIONS integration by default', done => {
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/echo'))
+				.then(resourceId => {
+					return apiGateway.getIntegrationPromise({
+						httpMethod: 'OPTIONS',
+						resourceId: resourceId,
+						restApiId: apiId
+					}).then(r => {
+						expect(r).toBeUndefined();
+						done.fail('OPTIONS resource created');
+					}).catch(e => {
+						expect(e.code).toEqual('NotFoundException');
+					});
+				}).then(done, done.fail);
+			});
+			it('allows the API to set up its own OPTIONS for specific resources', done => {
+				apiRouteConfig.routes.manual = {GET: {}, OPTIONS: {}};
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/manual'))
+				.then(resourceId => apiGateway.getIntegrationPromise({
+					httpMethod: 'OPTIONS',
+					resourceId: resourceId,
+					restApiId: apiId
+				}))
+				.then(response => expect(response.type).toEqual('AWS_PROXY'))
+				.then(() => {
+					return invoke(stageName + '/manual', {
+						method: 'OPTIONS',
+						headers: {'content-type': 'text/plain'},
+						body: JSON.stringify({
+							'Access-Control-Allow-Methods': 'GET,OPTIONS',
+							'Access-Control-Allow-Headers': 'X-Custom-Header,X-Api-Key',
+							'Access-Control-Allow-Origin': 'custom-origin',
+							'Access-Control-Allow-credentials': 'c1-false'
+						})
+					});
+				}).then(contents => {
+					expect(contents.headers['access-control-allow-methods']).toEqual('GET,OPTIONS');
+					expect(contents.headers['access-control-allow-headers']).toEqual('X-Custom-Header,X-Api-Key');
+					expect(contents.headers['access-control-allow-origin']).toEqual('custom-origin');
+					expect(contents.headers['access-control-allow-credentials']).toEqual('c1-false');
 				}).then(done, done.fail);
 			});
 		});
@@ -867,9 +1144,16 @@ describe('rebuildWebApi', () => {
 			});
 			it('routes the OPTIONS handler to Lambda', done => {
 				apiRouteConfig.routes.hello = {POST: {}, GET: {}};
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/echo'))
+				.then(resourceId => apiGateway.getIntegrationPromise({
+					httpMethod: 'OPTIONS',
+					resourceId: resourceId,
+					restApiId: apiId
+				}))
+				.then(response => expect(response.type).toEqual('AWS_PROXY'))
 				.then(() => {
-					return invoke('original/echo', {
+					return invoke(stageName + '/echo', {
 						method: 'OPTIONS',
 						headers: {'content-type': 'text/plain'},
 						body: JSON.stringify({
@@ -890,14 +1174,42 @@ describe('rebuildWebApi', () => {
 				});
 			});
 		});
+		describe('when corsHandlers are set to a string', () => {
+			beforeEach(() => {
+				apiRouteConfig.corsHandlers = 'api.test.com';
+			});
+			it('creates a MOCK integration for the fixed domain', done => {
+
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
+				.then(() => getResourceForPath('/echo'))
+				.then(resourceId => {
+					return apiGateway.getIntegrationPromise({
+						httpMethod: 'OPTIONS',
+						resourceId: resourceId,
+						restApiId: apiId
+					});
+				}).then(response => {
+					expect(response.type).toEqual('MOCK');
+				}).then(() => {
+					return invoke(stageName + '/echo', { method: 'OPTIONS' });
+				}).then(contents => {
+					expect(contents.headers['access-control-allow-methods']).toEqual('OPTIONS,GET');
+					expect(contents.headers['access-control-allow-headers']).toEqual('Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token');
+					expect(contents.headers['access-control-allow-origin']).toEqual('api.test.com');
+					expect(contents.headers['access-control-allow-credentials']).toEqual('true');
+					expect(contents.headers['access-control-max-age']).toBeUndefined();
+				}).then(done, done.fail);
+			});
+		});
+
 		describe('when corsMaxAge is set', () => {
 			beforeEach(() => {
 				apiRouteConfig.corsMaxAge = 10;
 			});
 			it('uses the headers for OPTIONS handlers', done => {
-				underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+				underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 					.then(() => {
-						return invoke('original/echo', {method: 'OPTIONS'});
+						return invoke(stageName + '/echo', {method: 'OPTIONS'});
 					}).then(contents => {
 						expect(contents.headers['access-control-allow-origin']).toEqual('*');
 						expect(contents.headers['access-control-allow-credentials']).toEqual('true');
@@ -905,33 +1217,42 @@ describe('rebuildWebApi', () => {
 					}).then(done, done.fail);
 			});
 		});
+
 	});
 
 	describe('when working with an existing api', () => {
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/apigw-proxy-echo/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(() => {
+			createGenericLambda('spec/test-projects/apigw-proxy-echo', stageName)
+			.then(() => {
 				apiRouteConfig.routes.hello = {POST: {}};
 				apiRouteConfig.routes[''] = {GET: {}, PUT: {}};
 				apiRouteConfig.routes.sub = {GET: {}, PUT: {}};
 				apiRouteConfig.routes['sub/mapped/sub2'] = {GET: {}, PUT: {}};
 				apiRouteConfig.corsHandlers = false;
-				return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion);
+				return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion);
 			}).then(done, done.fail);
 		});
+		it('removes all previous custom gateway responses', done => {
+			apiGateway.putGatewayResponsePromise({
+				restApiId: apiId,
+				responseType: 'DEFAULT_4XX',
+				statusCode: '411'
+			})
+			.then(() => underTest(genericLambdaName, stageName, apiId, {version: 2, routes: {extra: { GET: {}}}}, ownerAccount, awsPartition, awsRegion))
+			.then(() => getCustomGatewayResponses())
+			.then(result => expect(result).toEqual([]))
+			.then(done, done.fail);
+		});
+		it('adds new custom gateway responses', done => {
+			underTest(genericLambdaName, stageName, apiId, {version: 3, routes: {extra: { GET: {}}}, customResponses: {'DEFAULT_4XX': {statusCode: 411}}}, ownerAccount, awsPartition, awsRegion)
+			.then(() => getCustomGatewayResponses())
+			.then(result => expect(result.map(r => r.responseType)).toEqual(['DEFAULT_4XX']))
+			.then(done, done.fail);
+		});
 		it('adds extra paths from the new definition', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, {version: 2, routes: {extra: { GET: {}}}}, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, {version: 2, routes: {extra: { GET: {}}}}, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/extra');
+				return invoke(stageName + '/extra');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
@@ -939,9 +1260,9 @@ describe('rebuildWebApi', () => {
 			}).then(done, done.fail);
 		});
 		it('adds subresources mapped with intermediate paths', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, {version: 2, routes: {'sub/map2/map3': { GET: {}}}}, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, {version: 2, routes: {'sub/map2/map3': { GET: {}}}}, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/sub/map2/map3');
+				return invoke(stageName + '/sub/map2/map3');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
@@ -953,9 +1274,9 @@ describe('rebuildWebApi', () => {
 		});
 		it('adds extra methods to an existing path', done => {
 			apiRouteConfig.routes.echo.POST = {};
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/echo', {method: 'POST'});
+				return invoke(stageName + '/echo', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
@@ -964,15 +1285,15 @@ describe('rebuildWebApi', () => {
 		});
 		it('replaces root path handlers', done => {
 			apiRouteConfig.routes[''] = { POST: {}, GET: {} };
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
-				return invoke('original/', {method: 'POST'});
+				return invoke(stageName + '/', {method: 'POST'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('POST');
 				expect(params.requestContext.resourcePath).toEqual('/');
 			}).then(() => {
-				return invoke('original/', {method: 'GET'});
+				return invoke(stageName + '/', {method: 'GET'});
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.requestContext.httpMethod).toEqual('GET');
@@ -982,20 +1303,20 @@ describe('rebuildWebApi', () => {
 		it('preserves old stage variables', done => {
 			apiGateway.createDeploymentPromise({
 				restApiId: apiId,
-				stageName: 'original',
+				stageName: stageName,
 				variables: {
-					lambdaVersion: 'original',
+					lambdaVersion: stageName,
 					authKey: 'abs123',
 					authBucket: 'bucket123'
 				}
 			}).then(() => {
-				return underTest(newObjects.lambdaFunction, 'original', apiId, {corsHandlers: false, version: 2, routes: {extra: { GET: {}}}}, awsRegion);
+				return underTest(genericLambdaName, stageName, apiId, {corsHandlers: false, version: 2, routes: {extra: { GET: {}}}}, ownerAccount, awsPartition, awsRegion);
 			}).then(() => {
-				return invoke('original/extra');
+				return invoke(stageName + '/extra');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.stageVariables).toEqual({
-					lambdaVersion: 'original',
+					lambdaVersion: stageName,
 					authKey: 'abs123',
 					authBucket: 'bucket123'
 				});
@@ -1006,7 +1327,7 @@ describe('rebuildWebApi', () => {
 		const testMethodConfig = function (methodConfig, resourcePath, method) {
 			let echoResourceId;
 			apiRouteConfig.routes = methodConfig;
-			return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion)
+			return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion)
 			.then(() => {
 				return apiGateway.getResourcesPromise({
 					restApiId: apiId
@@ -1027,17 +1348,8 @@ describe('rebuildWebApi', () => {
 			});
 		};
 		beforeEach(done => {
-			shell.cp('-r', 'spec/test-projects/apigw-proxy-echo/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
+			createGenericLambda('spec/test-projects/apigw-proxy-echo', stageName)
+			.then(done, done.fail);
 		});
 		it('sets no request parameters if path params are not present', done => {
 			testMethodConfig({ '/echo': {GET: {}}}, '/echo', 'GET').then(result => {
@@ -1119,22 +1431,13 @@ describe('rebuildWebApi', () => {
 		let logger;
 		beforeEach(done => {
 			logger = new ArrayLogger();
-			shell.cp('-r', 'spec/test-projects/echo/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
+			createGenericLambda('spec/test-projects/echo', stageName)
+			.then(done, done.fail);
 		});
 		it('logs execution', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, logger).then(() => {
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger).then(() => {
 				expect(logger.getApiCallLogForService('apigateway', true)).toEqual([
-					'apigateway.getRestApi',
+					'apigateway.putRestApi',
 					'apigateway.setupRequestListeners',
 					'apigateway.setAcceptHeader',
 					'apigateway.getResources',
@@ -1143,9 +1446,7 @@ describe('rebuildWebApi', () => {
 					'apigateway.putIntegration',
 					'apigateway.putMethodResponse',
 					'apigateway.putIntegrationResponse',
-					'apigateway.createDeployment'
-				]);
-				expect(logger.getApiCallLogForService('sts', true)).toEqual(['sts.getCallerIdentity']);
+					'apigateway.createDeployment']);
 			}).then(done, done.fail);
 		});
 	});
@@ -1153,32 +1454,23 @@ describe('rebuildWebApi', () => {
 		let logger;
 		beforeEach(done => {
 			logger = new ArrayLogger();
-			shell.cp('-r', 'spec/test-projects/apigw-proxy-echo/*', workingdir);
-			create({name: testRunName, version: 'original', role: genericTestRole.get(), region: awsRegion, source: workingdir, handler: 'main.handler'}).then(result => {
-				newObjects.lambdaFunction = result.lambda && result.lambda.name;
-			}).then(() => {
-				return apiGateway.createRestApiPromise({
-					name: testRunName
-				});
-			}).then(result => {
-				apiId = result.id;
-				newObjects.restApi = result.id;
-			}).then(done, done.fail);
+			createGenericLambda('spec/test-projects/apigw-proxy-echo', stageName)
+			.then(done, done.fail);
 		});
 		it('stores the configuration hash in a stage variable', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, logger, 'configHash').then(() => {
-				return invoke('original/echo');
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger, 'configHash').then(() => {
+				return invoke(stageName + '/echo');
 			}).then(contents => {
 				const params = JSON.parse(contents.body);
 				expect(params.stageVariables).toEqual({
-					lambdaVersion: 'original',
-					configHash: 'nWvdJ3sEScZVJeZSDq4LZtDsCZw9dDdmsJbkhnuoZIY='
+					lambdaVersion: stageName,
+					configHash: '-EDMbG0OcNlCZzstFc2jH6rlpI1YDlNYc9YGGxUFuXo='
 				});
 			}).then(done, done.fail);
 		});
 		it('runs through the whole deployment if there was no previous stage by this name', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, undefined, 'configHash').then(() => {
-				return underTest(newObjects.lambdaFunction, 'latest', apiId, apiRouteConfig, awsRegion, logger, 'configHash');
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, undefined, 'configHash').then(() => {
+				return underTest(genericLambdaName, 'latest', apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger, 'configHash');
 			}).then(result => {
 				expect(result.cacheReused).toBeFalsy();
 				expect(logger.getApiCallLogForService('apigateway', true)).toContain('apigateway.createResource');
@@ -1186,8 +1478,8 @@ describe('rebuildWebApi', () => {
 			}).then(done, done.fail);
 		});
 		it('runs through the whole deployment if there was no config hash in the previous stage with the same name', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, undefined).then(() => {
-				return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, logger, 'configHash');
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, undefined).then(() => {
+				return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger, 'configHash');
 			}).then(result => {
 				expect(result.cacheReused).toBeFalsy();
 				expect(logger.getApiCallLogForService('apigateway', true)).toContain('apigateway.createResource');
@@ -1195,9 +1487,9 @@ describe('rebuildWebApi', () => {
 			}).then(done, done.fail);
 		});
 		it('runs through the whole deployment if there was a previous config hash but was different', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, undefined, 'configHash').then(() => {
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, undefined, 'configHash').then(() => {
 				apiRouteConfig.routes.echo.POST = {};
-				return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, logger, 'configHash');
+				return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger, 'configHash');
 			}).then(result => {
 				expect(result.cacheReused).toBeFalsy();
 				expect(logger.getApiCallLogForService('apigateway', true)).toContain('apigateway.createResource');
@@ -1205,15 +1497,14 @@ describe('rebuildWebApi', () => {
 			}).then(done, done.fail);
 		});
 		it('skips deleting and creating resources if there was a previous stage with the same name and config hash', done => {
-			underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, undefined, 'configHash').then(() => {
-				return underTest(newObjects.lambdaFunction, 'original', apiId, apiRouteConfig, awsRegion, logger, 'configHash');
+			underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, undefined, 'configHash').then(() => {
+				return underTest(genericLambdaName, stageName, apiId, apiRouteConfig, ownerAccount, awsPartition, awsRegion, logger, 'configHash');
 			}).then(result => {
 				expect(result.cacheReused).toBeTruthy();
 				expect(logger.getApiCallLogForService('apigateway', true)).toEqual([
-					'apigateway.getRestApi',
+					'apigateway.getStage',
 					'apigateway.setupRequestListeners',
-					'apigateway.setAcceptHeader',
-					'apigateway.getStage'
+					'apigateway.setAcceptHeader'
 				]);
 				expect(logger.getStageLog(true)).toContain('Reusing cached API configuration');
 			}).then(done, done.fail);

@@ -48,6 +48,9 @@ const fs = require('fs'),
 			if (argDoc.default) {
 				pushLines(indent('* _Defaults to_: ' + argDoc.default, 4));
 			}
+			if (argDoc.since) {
+				pushLines(indent('* _Introduced in version_: ' + argDoc.since, 4));
+			}
 		});
 		lines.push('');
 		return lines.join('\n');
@@ -83,12 +86,16 @@ const fs = require('fs'),
 		lines.push('');
 		lines.push('## Options:');
 		lines.push('');
-		lines.push(' * --help           print this help screen');
-		lines.push(' * --version        print out the current version');
-		lines.push(' * --quiet          suppress output when executing commands');
-		lines.push(' * --profile		set AWS credentials profile');
+		lines.push(' * --help               print this help screen');
+		lines.push(' * --version            print out the current version');
+		lines.push(' * --quiet              suppress output when executing commands');
+		lines.push(' * --profile            set AWS credentials profile');
+		lines.push(' * --sts-role-arn       set AWS STS Role for token-based authentication');
+		lines.push(' * --mfa-serial         set AWS MFA Serial Number (requires --sts-role-arn)');
+		lines.push(' * --mfa-token          set AWS MFA Token Code (requires --sts-role-arn)');
+		lines.push(' * --mfa-duration       set AWS MFA Duration in seconds (requires --sts-role-arn). Defaults to 3600');
 		lines.push(' * --aws-client-timeout The number of milliseconds to wait before connection time out on AWS SDK Client. Defaults to two minutes (120000)');
-		lines.push(' * --proxy			set HTTP proxy for AWS commands');
+		lines.push(' * --proxy              set HTTP proxy for AWS commands');
 		lines.push('');
 		lines.push('Run with a command name to see options of a specific command, for example:');
 		lines.push('```bash');

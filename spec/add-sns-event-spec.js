@@ -2,10 +2,10 @@
 const underTest = require('../src/commands/add-sns-event-source'),
 	create = require('../src/commands/create'),
 	destroyObjects = require('./util/destroy-objects'),
-	shell = require('shelljs'),
 	tmppath = require('../src/util/tmppath'),
 	retry = require('oh-no-i-insist'),
 	fs = require('fs'),
+	fsUtil = require('../src/util/fs-util'),
 	path = require('path'),
 	aws = require('aws-sdk'),
 	awsRegion = require('./util/test-aws-region');
@@ -19,7 +19,7 @@ describe('addSNSEventSource', () => {
 		sns = new aws.SNS({ region: awsRegion });
 		testRunName = 'test' + Date.now();
 		newObjects = { workingdir: workingdir };
-		shell.mkdir(workingdir);
+		fs.mkdirSync(workingdir);
 		config = {
 			topic: 'test-topic',
 			source: workingdir
@@ -36,6 +36,16 @@ describe('addSNSEventSource', () => {
 			done();
 		});
 	});
+	it('fails when both filter-policy and filter-policy-file are set', done => {
+		config['filter-policy'] = '{}';
+		config['filter-policy-file'] = 'x.json';
+		underTest(config)
+		.then(done.fail, reason => {
+			expect(reason).toEqual('Cannot use both filter-policy and filter-policy-file. Specify only one.');
+			done();
+		});
+	});
+
 	it('fails when the source dir does not contain the project config file', done => {
 		underTest(config).then(done.fail, reason => {
 			expect(reason).toEqual('claudia.json does not exist in the source folder');
@@ -70,7 +80,7 @@ describe('addSNSEventSource', () => {
 		};
 		beforeEach(done => {
 			createConfig = { name: testRunName, region: awsRegion, source: workingdir, handler: 'main.handler' };
-			shell.cp('-r', 'spec/test-projects/hello-world/*', workingdir);
+			fsUtil.copy('spec/test-projects/hello-world', workingdir, true);
 			sns.createTopic({
 				Name: `${testRunName}-topic`
 			}).promise()
@@ -96,6 +106,47 @@ describe('addSNSEventSource', () => {
 			.then(config => {
 				expect(config.Subscriptions.length).toBe(1);
 				expect(config.Subscriptions[0].Endpoint).toEqual(functionArn);
+			})
+			.then(done, done.fail);
+		});
+		it('does not add a filter policy if not requested', done =>	{
+			createLambda()
+			.then(() => underTest(config))
+			.then(() => sns.listSubscriptionsByTopic({TopicArn: config.topic}).promise())
+			.then(result => sns.getSubscriptionAttributes({SubscriptionArn: result.Subscriptions[0].SubscriptionArn}).promise())
+			.then(attr => {
+				expect(attr.Attributes.FilterPolicy).toBeFalsy();
+			})
+			.then(done, done.fail);
+		});
+
+		it('adds a filter policy if requested', done =>	{
+			const policy = {
+				provider: ['some-provider']
+			};
+			config['filter-policy'] = JSON.stringify(policy);
+			createLambda()
+			.then(() => underTest(config))
+			.then(() => sns.listSubscriptionsByTopic({TopicArn: config.topic}).promise())
+			.then(result => sns.getSubscriptionAttributes({SubscriptionArn: result.Subscriptions[0].SubscriptionArn}).promise())
+			.then(attr => {
+				expect(JSON.parse(attr.Attributes.FilterPolicy)).toEqual(policy);
+			})
+			.then(done, done.fail);
+		});
+		it('adds a filter policy from a file if requested', done =>	{
+			const policy = {
+					provider: ['some-provider']
+				},
+				policyFile = path.join(workingdir, 'sns-policy.json');
+			fs.writeFileSync(policyFile, JSON.stringify(policy), 'utf8');
+			config['filter-policy-file'] = policyFile;
+			createLambda()
+			.then(() => underTest(config))
+			.then(() => sns.listSubscriptionsByTopic({TopicArn: config.topic}).promise())
+			.then(result => sns.getSubscriptionAttributes({SubscriptionArn: result.Subscriptions[0].SubscriptionArn}).promise())
+			.then(attr => {
+				expect(JSON.parse(attr.Attributes.FilterPolicy)).toEqual(policy);
 			})
 			.then(done, done.fail);
 		});

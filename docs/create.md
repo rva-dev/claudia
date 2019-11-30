@@ -10,7 +10,8 @@ claudia create {OPTIONS}
 
 ## Options
 
-*  `--region`:  AWS region where to create the lambda
+*  `--region`:  AWS region where to create the lambda. For supported values, see
+    https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
     * _For example_: us-east-1
 *  `--handler`:  (_optional_) Main function for Lambda to execute, as module.function
     * _For example_: if it is in the main.js file and exported as router, this would be main.router
@@ -21,6 +22,11 @@ claudia create {OPTIONS}
 *  `--deploy-proxy-api`:  (_optional_) If specified, a proxy API will be created for the Lambda 
     function on API Gateway, and forward all requests to function.
     This is an alternative way to create web APIs to --api-module.
+*  `--binary-media-types`:  (_optional_) A comma-delimited list of binary-media-types to 
+    set when using --deploy-proxy-api. Use an empty string in quotes
+    to not set any binary media types.
+    * _For example_: image/png,image/jpeg
+    * _Defaults to_: */*
 *  `--name`:  (_optional_) lambda function name
     * _For example_: awesome-microservice
     * _Defaults to_: the project name from package.json
@@ -39,7 +45,7 @@ claudia create {OPTIONS}
     * _For example_: arn:aws:iam::123456789012:role/FileConverter
 *  `--runtime`:  (_optional_) Node.js runtime to use. For supported values, see
     http://docs.aws.amazon.com/lambda/latest/dg/API_CreateFunction.html
-    * _Defaults to_: nodejs6.10
+    * _Defaults to_: nodejs12.x
 *  `--description`:  (_optional_) Textual description of the lambda function
     * _Defaults to_: the project description from package.json
 *  `--memory`:  (_optional_) The amount of memory, in MB, your Lambda function is given.
@@ -49,15 +55,24 @@ claudia create {OPTIONS}
     * _Defaults to_: 3
 *  `--no-optional-dependencies`:  (_optional_) Do not upload optional dependencies to Lambda.
 *  `--use-local-dependencies`:  (_optional_) Do not install dependencies, use local node_modules directory instead
+*  `--npm-options`:  (_optional_) Any additional options to pass on to NPM when installing packages. Check https://docs.npmjs.com/cli/install for more information
+    * _For example_: --ignore-scripts
+    * _Introduced in version_: 5.0.0
 *  `--cache-api-config`:  (_optional_) Name of the stage variable for storing the current API configuration signature.
     If set, it will also be used to check if the previously deployed configuration can be re-used and speed up deployment
     * _For example_: claudiaConfigCache
+*  `--post-package-script`:  (_optional_) the name of a NPM script to execute custom processing after claudia finished packaging your files.
+    Note that development dependencies are not available at this point, but you can use npm uninstall to remove utility tools as part of this step.
+    * _For example_: customNpmScript
+    * _Introduced in version_: 5.0.0
 *  `--keep`:  (_optional_) keep the produced package archive on disk for troubleshooting purposes.
     If not set, the temporary files will be removed after the Lambda function is successfully created
 *  `--use-s3-bucket`:  (_optional_) The name of a S3 bucket that Claudia will use to upload the function code before installing in Lambda.
     You can use this to upload large functions over slower connections more reliably, and to leave a binary artifact
     after uploads for auditing purposes. If not set, the archive will be uploaded directly to Lambda
     * _For example_: claudia-uploads
+*  `--s3-sse`:  (_optional_) The type of Server Side Encryption applied to the S3 bucket referenced in `--use-s3-bucket`
+    * _For example_: AES256
 *  `--aws-delay`:  (_optional_) number of milliseconds betweeen retrying AWS operations if they fail
     * _For example_: 3000
     * _Defaults to_: 5000
@@ -76,3 +91,7 @@ claudia create {OPTIONS}
 *  `--set-env-from-json`:  (_optional_) file path to a JSON file containing environment variables to set.  Variable values can reference environment variables via ${env.} syntax (e.g. "DB_PSWD"="${env.DB_PSWD}" ).
     * _For example_: production-env.json
 *  `--env-kms-key-arn`:  (_optional_) KMS Key ARN to encrypt/decrypt environment variables
+*  `--layers`:  (_optional_) A comma-delimited list of Lambda layers to attach to this function
+    * _For example_: arn:aws:lambda:us-east-1:12345678:layer:ffmpeg:4
+*  `--dlq-sns`:  (_optional_) Dead letter queue SNS topic name or ARN
+    * _For example_: arn:aws:sns:us-east-1:123456789012:my_corporate_topic

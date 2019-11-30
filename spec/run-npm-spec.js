@@ -1,7 +1,7 @@
 /*global describe, it, beforeEach, afterEach, require, it, expect */
 const underTest = require('../src/util/run-npm'),
-	shell = require('shelljs'),
 	fs = require('fs'),
+	fsUtil = require('../src/util/fs-util'),
 	ArrayLogger = require('../src/util/array-logger'),
 	tmppath = require('../src/util/tmppath'),
 	path = require('path');
@@ -16,17 +16,17 @@ describe('runNpm', () => {
 
 	beforeEach(() => {
 		sourcedir = tmppath();
-		shell.mkdir(sourcedir);
+		fs.mkdirSync(sourcedir);
 		logger = new ArrayLogger();
-		pwd = shell.pwd();
+		pwd = process.cwd();
 	});
 	afterEach(() => {
-		shell.cd(pwd);
+		process.chdir(pwd);
 		if (sourcedir) {
-			shell.rm('-rf', sourcedir);
+			fsUtil.silentRemove(sourcedir);
 		}
 	});
-	it('executes NPM in a folder', done => {
+	it('executes NPM in a folder with arguments as a string', done => {
 		configurePackage({
 			dependencies: {
 				'uuid': '^2.0.0'
@@ -35,14 +35,32 @@ describe('runNpm', () => {
 				'minimist': '^1.2.0'
 			}
 		});
-		underTest(sourcedir, 'install --production', logger).then(packagePath => {
+		underTest(sourcedir, 'install -s --production', logger, true).then(packagePath => {
 			expect(packagePath).toEqual(sourcedir);
-			expect(shell.pwd()).toEqual(pwd);
-			expect(shell.test('-e', path.join(sourcedir, 'node_modules', 'uuid'))).toBeTruthy();
-			expect(shell.test('-e', path.join(sourcedir, 'node_modules', 'minimist'))).toBeFalsy();
+			expect(process.cwd()).toEqual(pwd);
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'uuid'))).toBeTruthy();
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'minimist'))).toBeFalsy();
 			done();
 		}, done.fail);
 	});
+	it('executes NPM in a folder with arguments as an array', done => {
+		configurePackage({
+			dependencies: {
+				'uuid': '^2.0.0'
+			},
+			devDependencies: {
+				'minimist': '^1.2.0'
+			}
+		});
+		underTest(sourcedir, ['install', '-s', '--production'], logger, true).then(packagePath => {
+			expect(packagePath).toEqual(sourcedir);
+			expect(process.cwd()).toEqual(pwd);
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'uuid'))).toBeTruthy();
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'minimist'))).toBeFalsy();
+			done();
+		}, done.fail);
+	});
+
 	it('uses local .npmrc if exists', done => {
 		configurePackage({
 			dependencies: {
@@ -53,11 +71,11 @@ describe('runNpm', () => {
 			}
 		});
 		fs.writeFileSync(path.join(sourcedir, '.npmrc'), 'optional = false', 'utf8');
-		underTest(sourcedir, 'install --production', logger).then(packagePath => {
+		underTest(sourcedir, 'install -s --production', logger, true).then(packagePath => {
 			expect(packagePath).toEqual(sourcedir);
-			expect(shell.pwd()).toEqual(pwd);
-			expect(shell.test('-e', path.join(sourcedir, 'node_modules', 'uuid'))).toBeTruthy();
-			expect(shell.test('-e', path.join(sourcedir, 'node_modules', 'minimist'))).toBeFalsy();
+			expect(process.cwd()).toEqual(pwd);
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'uuid'))).toBeTruthy();
+			expect(fs.existsSync(path.join(sourcedir, 'node_modules', 'minimist'))).toBeFalsy();
 			done();
 		}, done.fail);
 
@@ -69,8 +87,8 @@ describe('runNpm', () => {
 				'non-existing-package': '2.0.0'
 			}
 		});
-		underTest(sourcedir, 'install --production', logger).then(done.fail, reason => {
-			expect(reason).toMatch(/npm install --production failed/);
+		underTest(sourcedir, 'install -s --production', logger, true).then(done.fail, reason => {
+			expect(reason).toMatch(/npm install -s --production failed/);
 			done();
 		});
 	});
