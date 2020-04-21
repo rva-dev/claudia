@@ -1,6 +1,6 @@
 {
   "name": "claudia",
-  "version": "5.11.0",
+  "version": "5.12.1",
   "description": "Deploy Node.js projects to AWS Lambda and API Gateway easily.",
   "license": "MIT",
   "repository": {
@@ -40,9 +40,9 @@
     "pretest": "eslint .",
     "test": "node spec/support/jasmine-runner.js",
     "debug": "node --debug-brk --inspect spec/support/jasmine-runner.js",
-    "integration-build": "aws codebuild start-build --project-name claudia-node8 --region us-west-2 --profile claudia-test",
-    "integration-results": "aws s3 cp s3://claudiatestresults/claudia-node8/buildresult.txt . --profile claudia-test",
-    "integration-build-status": "aws codebuild batch-get-builds --ids $(aws codebuild list-builds-for-project --project-name claudia-node8 --profile claudia-test --region us-west-2 --query 'ids[0]' --output text) --region us-west-2 --profile claudia-test --query 'builds[].buildStatus' --output text"
+    "integration-build": "aws codebuild start-build --project-name claudiajs --region us-west-2 --profile claudia-test",
+    "integration-results": "aws s3 cp s3://claudiatestresults/claudiajs/buildresult.txt . --profile claudia-test",
+    "integration-build-status": "aws codebuild batch-get-builds --ids $(aws codebuild list-builds-for-project --project-name claudiajs --profile claudia-test --region us-west-2 --query 'ids[0]' --output text) --region us-west-2 --profile claudia-test --query 'builds[].buildStatus' --output text"
   },
   "author": "Gojko Adzic <gojko@gojko.com> (http://gojko.net)",
   "contributors": [
@@ -51,7 +51,7 @@
   ],
   "dependencies": {
     "archiver": "^3.0.0",
-    "aws-sdk": "^2.454.0",
+    "aws-sdk": "^2.607.0",
     "fs-extra": "^6.0.1",
     "glob": "^7.1.2",
     "gunzip-maybe": "^1.4.0",

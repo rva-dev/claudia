@@ -22,7 +22,7 @@ describe('create', () => {
 
 	let workingdir, testRunName, iam, lambda, s3, newObjects, config, logs, apiGatewayPromise, sns;
 	const defaultRuntime = 'nodejs12.x',
-		supportedRuntimes = ['nodejs12.x', 'nodejs10.x', 'nodejs8.10'],
+		supportedRuntimes = ['nodejs12.x', 'nodejs10.x'],
 		createFromDir = function (dir, logger) {
 			if (!fs.existsSync(workingdir)) {
 				fs.mkdirSync(workingdir);
@@ -219,6 +219,13 @@ describe('create', () => {
 			config.role = 'arn:aws:iam::123456789012:role/S3Access';
 			createFromDir('hello-world')
 			.then(done.fail, message => expect(message).toMatch(/incompatible arguments allow-recursion and role/))
+			.then(done);
+		});
+		it('fails if s3-key is specified but use-s3-bucket is not', done => {
+			config['s3-key'] = 'foo';
+			config['use-s3-bucket'] = undefined;
+			createFromDir('hello-world')
+			.then(done.fail, message => expect(message).toEqual('--s3-key only works with --use-s3-bucket'))
 			.then(done);
 		});
 	});
@@ -890,6 +897,40 @@ describe('create', () => {
 			})
 			.then(done, done.fail);
 		});
+		it('uses an s3 key if provided', done => {
+			const logger = new ArrayLogger(),
+				bucketName = `${testRunName}-bucket`,
+				keyName = `${testRunName}-key`;
+			let archivePath;
+			config.keep = true;
+			config['use-s3-bucket'] = bucketName;
+			config['s3-key'] = keyName;
+			s3.createBucket({
+				Bucket: bucketName
+			}).promise()
+			.then(() => {
+				newObjects.s3Bucket = bucketName;
+				newObjects.s3Key = keyName;
+			})
+			.then(() => createFromDir('hello-world', logger))
+			.then(result => {
+				const expectedKey = keyName;
+				archivePath = result.archive;
+				expect(result.s3key).toEqual(expectedKey);
+				return s3.headObject({
+					Bucket: bucketName,
+					Key: expectedKey
+				}).promise();
+			})
+			.then(fileResult => expect(parseInt(fileResult.ContentLength)).toEqual(fs.statSync(archivePath).size))
+			.then(() => expect(logger.getApiCallLogForService('s3', true)).toEqual(['s3.upload', 's3.getSignatureVersion']))
+			.then(() => lambda.invoke({ FunctionName: testRunName }).promise())
+			.then(lambdaResult => {
+				expect(lambdaResult.StatusCode).toEqual(200);
+				expect(lambdaResult.Payload).toEqual('"hello world"');
+			})
+			.then(done, done.fail);
+		});
 	});
 	describe('deploying a proxy api', () => {
 		beforeEach(() => {
@@ -1179,7 +1220,7 @@ describe('create', () => {
 				'lambda.createFunction',  'lambda.setupRequestListeners', 'lambda.updateAlias', 'lambda.createAlias'
 			]);
 			expect(logger.getApiCallLogForService('iam', true)).toEqual(['iam.createRole', 'iam.putRolePolicy']);
-			expect(logger.getApiCallLogForService('sts', true)).toEqual(['sts.getCallerIdentity']);
+			expect(logger.getApiCallLogForService('sts', true)).toEqual(['sts.getCallerIdentity', 'sts.setupRequestListeners', 'sts.optInRegionalEndpoint']);
 			expect(logger.getApiCallLogForService('apigateway', true)).toEqual([
 				'apigateway.createRestApi',
 				'apigateway.setupRequestListeners',
